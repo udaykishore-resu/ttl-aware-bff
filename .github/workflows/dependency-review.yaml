@@ -1,0 +1,79 @@
+# Dependency review on pull requests.
+#
+# Answers a question no other scanner in this repository answers: "does THIS
+# pull request introduce a new vulnerable or badly licensed dependency?"
+#
+#   govulncheck (ci.yaml)  reachable vulnerabilities in the current tree
+#   Trivy fs    (ci.yaml)  every known CVE in go.sum, reachable or not
+#   this        the DELTA introduced by the PR, plus licence policy
+#
+# The distinction matters: a PR that adds a dependency with a critical CVE
+# should be blocked at review time, not discovered later in a full-tree scan
+# that has been failing for a week for unrelated reasons.
+
+name: Dependency Review
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: dependency-review-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Review dependency changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Post the findings as a summary comment on the PR.
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          # Block the merge on a new high-or-worse vulnerability. Moderate and
+          # below are surfaced in the summary but do not fail: a hard gate on
+          # moderate findings mostly trains people to bypass it.
+          fail-on-severity: high
+
+          # --- Licence policy ------------------------------------------
+          # Copyleft licences that would impose obligations on this service if
+          # linked into the binary. Denied rather than merely flagged, because
+          # discovering one after release is expensive to unwind.
+          deny-licenses: >-
+            AGPL-1.0-only,
+            AGPL-1.0-or-later,
+            AGPL-3.0-only,
+            AGPL-3.0-or-later,
+            GPL-2.0-only,
+            GPL-2.0-or-later,
+            GPL-3.0-only,
+            GPL-3.0-or-later,
+            LGPL-3.0-only,
+            LGPL-3.0-or-later,
+            SSPL-1.0,
+            BUSL-1.1
+
+          # The generated protobuf stubs and any vendored offline-build sources
+          # are not dependency changes this policy should judge.
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+
+          comment-summary-in-pr: on-failure
+          # Show what changed even when nothing is wrong; a dependency bump is
+          # worth a reviewer's attention regardless of its CVE status.
+          show-openssf-scorecard: true
+          warn-only: false
+
+          # Dependencies knowingly accepted, with a reason. An entry here is a
+          # decision that someone made and can be re-examined, unlike a blanket
+          # severity downgrade.
+          allow-ghsas: ""

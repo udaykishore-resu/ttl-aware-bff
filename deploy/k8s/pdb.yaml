@@ -1,0 +1,39 @@
+# PodDisruptionBudget for the BFF.
+#
+# Constrains VOLUNTARY disruptions only — node drains, cluster-autoscaler
+# consolidation, `kubectl drain` during an EKS version upgrade. It does not
+# protect against node failure or eviction under memory pressure.
+#
+# maxUnavailable: 1 rather than minAvailable: N is deliberate. The HPA moves
+# the replica count between 3 and 30; a fixed minAvailable would either be
+# useless at 30 replicas or block all drains at 3. maxUnavailable stays correct
+# at every scale.
+#
+# Interaction with the rollout: deployment.yaml uses maxUnavailable: 0 /
+# maxSurge: 1, so a normal rollout never consumes this budget. The budget
+# exists for the node lifecycle.
+#
+# Caveat worth knowing: with minReplicas: 3 and maxUnavailable: 1, a drain of
+# two nodes proceeds serially. If the cluster ever runs this at 1 replica the
+# budget blocks drains entirely, which is why minReplicas is 3.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ttl-aware-bff
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/component: bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ttl-aware-bff
+      app.kubernetes.io/instance: ttl-aware-bff
+  # Do not let pods that are already unhealthy be counted as protected: without
+  # this, a fleet that is broken in a way readiness detects can wedge a node
+  # drain forever.
+  unhealthyPodEvictionPolicy: AlwaysAllow

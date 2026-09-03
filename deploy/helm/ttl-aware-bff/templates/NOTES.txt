@@ -1,0 +1,117 @@
+{{- $fullName := include "ttl-aware-bff.fullname" . -}}
+{{ .Chart.Name }} {{ .Chart.Version }} (app {{ include "ttl-aware-bff.imageTag" . }}) installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+IMAGE
+  {{ include "ttl-aware-bff.image" . }}
+
+REPLICAS
+{{- if .Values.autoscaling.enabled }}
+  Autoscaled: {{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} replicas.
+  Signals: CPU at {{ .Values.autoscaling.targetCPUUtilizationPercentage }}% of request
+{{- if .Values.autoscaling.customMetric.enabled }}, and {{ .Values.autoscaling.customMetric.name }} at {{ .Values.autoscaling.customMetric.averageValue }} per pod{{ end }}.
+{{- if .Values.autoscaling.customMetric.enabled }}
+
+  The custom metric needs prometheus-adapter or KEDA. Confirm it resolves:
+    kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/{{ .Release.Namespace }}/pods/*/{{ .Values.autoscaling.customMetric.name }}" | head
+  If that 404s, the HPA falls back to the CPU metric alone.
+{{- end }}
+{{- else }}
+  Fixed at {{ .Values.replicaCount }} replica(s); autoscaling is disabled.
+{{- end }}
+
+CHECK IT CAME UP
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ $fullName }} --timeout=5m
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- if .Values.tests.enabled }}
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- end }}
+
+REACH THE API
+{{- if .Values.ingress.enabled }}
+  Public:  https://{{ .Values.ingress.host }}{{ .Values.ingress.path }}/resources/{resourceId}
+
+  The ALB takes a few minutes to provision on first install. Watch it with:
+    kubectl -n {{ .Release.Namespace }} get ingress {{ $fullName }} -w
+{{- else }}
+  No Ingress is enabled. Port-forward instead:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullName }} {{ .Values.service.httpPort }}:{{ .Values.service.httpPort }}
+    curl -H "Authorization: Bearer $TOKEN" \
+      http://127.0.0.1:{{ .Values.service.httpPort }}/api/v1/resources/res-001
+{{- end }}
+
+  Every endpoint requires a JWT. Requests are classified into one of the six
+  request types and routed by the freshness of the operational source; the
+  response envelope's `meta.routingDecision` and `meta.routingRule` say which
+  rule fired.
+
+ADMIN AND TELEMETRY (port {{ .Values.service.adminPort }}, never exposed publicly)
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullName }} {{ .Values.service.adminPort }}:{{ .Values.service.adminPort }}
+    curl http://127.0.0.1:{{ .Values.service.adminPort }}/readyz
+    curl http://127.0.0.1:{{ .Values.service.adminPort }}/metrics | grep '^bff_'
+
+{{- if .Values.otel.enabled }}
+
+  Traces and metrics go over OTLP/gRPC to {{ .Values.otel.endpoint }},
+  head-sampled at {{ .Values.otel.traceSampleRatio }}. Root span: bff.request.
+{{- else }}
+
+  Telemetry is DISABLED (otel.enabled=false); the SDK is a no-op.
+{{- end }}
+{{- if .Values.serviceMonitor.enabled }}
+  A ServiceMonitor was created. It is only picked up if its label
+  {{- range $k, $v := .Values.serviceMonitor.labels }} {{ $k }}={{ $v }}{{ end }} matches your Prometheus operator's serviceMonitorSelector.
+{{- end }}
+
+CACHE
+{{- if .Values.redis.enabled }}
+  Using the bundled Redis subchart at {{ include "ttl-aware-bff.redisAddr" . }}.
+  This is fine for dev. For production set `redis.enabled=false` and point
+  `externalRedis.host` at the ElastiCache primary endpoint.
+{{- else if .Values.externalRedis.host }}
+  Using external Redis at {{ include "ttl-aware-bff.redisAddr" . }}{{ if .Values.externalRedis.tls }} (TLS){{ end }}.
+{{- else }}
+  No Redis configured; the cache falls back to what config.cache says.
+{{- end }}
+
+CURRENT FRESHNESS POLICY
+  request type              preferred   ttl     cache_ttl
+{{- range $name, $rt := .Values.config.routing.request_types }}
+  {{ printf "%-24s %-11s %-7s %s" $name (toString $rt.preferred_source) (toString $rt.ttl) (toString $rt.cache_ttl) }}
+{{- end }}
+{{- with .Values.routingOverrides }}
+
+  NOTE: routingOverrides is set, so the effective values differ from the table
+  above. See the rendered config:
+    kubectl -n {{ $.Release.Namespace }} get cm {{ include "ttl-aware-bff.configMapName" $ }} -o jsonpath='{.data.bff\.yaml}'
+{{- end }}
+{{- with .Values.tenantOverrides }}
+
+  Per-tenant overrides active for: {{ keys . | sortAlpha | join ", " }}
+{{- end }}
+
+{{- if and (not .Values.secrets.existingSecret) (not .Values.secrets.create) }}
+
+WARNING
+  No Secret is mounted. This is correct only when the JWKS verification path is
+  in use AND Redis needs no AUTH token. If either is untrue, the pod will fail
+  readiness. Supply one with `secrets.existingSecret` (External Secrets or
+  sealed-secrets — see deploy/k8s/secret.example.yaml).
+{{- end }}
+{{- if and .Values.secrets.create (not .Values.secrets.existingSecret) }}
+
+WARNING
+  secrets.create=true stores the credential values in the release's manifest,
+  readable by anyone who can run `helm get manifest`. Development only.
+{{- end }}
+{{- if and .Values.ingress.enabled (not .Values.ingress.alb.wafAclArn) (eq .Values.ingress.alb.scheme "internet-facing") }}
+
+WARNING
+  This is an internet-facing ALB with no WAF Web ACL attached
+  (ingress.alb.wafAclArn is empty). Set it, or confirm the Web ACL is attached
+  out of band.
+{{- end }}
+
+NEXT
+  Upgrade:   helm upgrade {{ .Release.Name }} deploy/helm/ttl-aware-bff -n {{ .Release.Namespace }} -f <values> --atomic
+  Roll back: helm rollback {{ .Release.Name }} -n {{ .Release.Namespace }}
+  Uninstall: helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}

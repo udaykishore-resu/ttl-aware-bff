@@ -1,0 +1,96 @@
+# syntax=docker/dockerfile:1.7
+#
+# ttl-aware-bff-exsource — reference Execution Data Source stub (cmd/exsource).
+#
+# Build context is the REPOSITORY ROOT:
+#
+#   docker build -f deploy/docker/Dockerfile.exsource \
+#     --build-arg VERSION="$(git describe --tags --always --dirty)" \
+#     -t ghcr.io/udaykishore/ttl-aware-bff-exsource:dev .
+#
+# Runtime contract (docs/DESIGN-CONTRACT.md §1):
+#   9102  REST HTTP (execution history / execution status)
+#   9112  admin/chaos HTTP (/healthz, /readyz, /livez, /metrics, /chaos/*)
+#
+# Same build pattern as Dockerfile.bff and Dockerfile.opsource. No HEALTHCHECK:
+# probes belong to Kubernetes (and to docker-compose.yaml for local runs).
+
+# ---------------------------------------------------------------------------
+# Stage 1: build
+# ---------------------------------------------------------------------------
+ARG GO_VERSION=1.24
+FROM golang:${GO_VERSION}-bookworm AS build
+
+# See Dockerfile.bff for the full note. Short version: leave GOFLAGS empty for a
+# normal environment (module download goes through proxy.golang.org); for an
+# air-gapped build run `go mod vendor` and pass `--build-arg GOFLAGS=-mod=vendor`,
+# or point GOPROXY at an internal mirror. The `replace` block in go.mod is a
+# local convenience for hosts without proxy.golang.org and is not relied on here.
+ARG GOFLAGS=""
+ENV GOFLAGS=${GOFLAGS}
+
+ENV CGO_ENABLED=0 \
+    GOOS=linux \
+    GOTOOLCHAIN=local
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download all
+
+COPY . .
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=1970-01-01T00:00:00Z
+ARG TARGETOS
+ARG TARGETARCH
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build \
+      -trimpath \
+      -tags osusergo,netgo \
+      -ldflags="-s -w \
+        -X main.version=${VERSION} \
+        -X main.commit=${COMMIT} \
+        -X main.buildDate=${BUILD_DATE}" \
+      -o /out/exsource \
+      ./cmd/exsource
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime
+# ---------------------------------------------------------------------------
+# See Dockerfile.bff: RUNTIME_IMAGE lets local development swap in the official
+# `debug-nonroot` distroless variant (same image + busybox) so that compose
+# healthchecks have a wget to call. Default stays the minimal image.
+ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
+FROM ${RUNTIME_IMAGE} AS runtime
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=1970-01-01T00:00:00Z
+ARG RUNTIME_IMAGE
+LABEL org.opencontainers.image.title="ttl-aware-bff-exsource" \
+      org.opencontainers.image.description="Reference Execution Data Source stub (REST) for the TTL-aware BFF, with latency and fault injection." \
+      org.opencontainers.image.source="https://github.com/udaykishore/ttl-aware-bff" \
+      org.opencontainers.image.documentation="https://github.com/udaykishore/ttl-aware-bff/blob/main/docs/DESIGN-CONTRACT.md" \
+      org.opencontainers.image.url="https://github.com/udaykishore/ttl-aware-bff" \
+      org.opencontainers.image.vendor="udaykishore" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.base.name="${RUNTIME_IMAGE}"
+
+COPY --from=build /out/exsource /usr/local/bin/exsource
+
+USER 65532:65532
+
+EXPOSE 9102 9112
+
+# No CMD: the stub binds the ports fixed by the design contract (9102 REST,
+# 9112 admin) by default. Supply `command:`/`args:` only to override them.
+ENTRYPOINT ["/usr/local/bin/exsource"]

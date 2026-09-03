@@ -1,0 +1,27 @@
+# Namespace for the TTL-aware BFF and its reference data-source stubs.
+#
+# The namespace name `bff` is fixed by docs/DESIGN-CONTRACT.md §9 and is
+# referenced from the NetworkPolicy, the ServiceMonitor's namespaceSelector,
+# the IRSA trust policy in deploy/terraform/modules/iam, and every kustomize
+# overlay. Do not rename it without updating all four.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+
+    # Pod Security Admission. The BFF runs unprivileged, with a read-only root
+    # filesystem and all capabilities dropped, so it satisfies `restricted`
+    # without exceptions. Enforcing at the namespace level means a future
+    # manifest cannot quietly regress that.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+  annotations:
+    # Consumed by the platform's ownership tooling; keep in step with the
+    # `owner` tag applied by the Terraform stack.
+    bff.internal/owner: "platform-engineering"
+    bff.internal/contract: "docs/DESIGN-CONTRACT.md"

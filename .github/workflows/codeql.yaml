@@ -1,0 +1,102 @@
+# Scheduled CodeQL analysis.
+#
+# ci.yaml already runs CodeQL on every push and pull request; that job gates
+# the change in front of you. This workflow exists for the other half of the
+# problem: GitHub publishes new queries continuously, and code that was clean
+# in January can have a known-vulnerable pattern in March without a single
+# commit. The weekly run catches exactly that.
+#
+# It also runs on pushes that touch the Go code, so a direct commit to main
+# (hotfix, revert) is analysed even if it never went through a PR.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/codeql.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+  schedule:
+    # Mondays at 06:17 UTC. The odd minute is deliberate: scheduled workflows
+    # at :00 contend with everyone else's and get queued.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # Write the results to the Security tab.
+      security-events: write
+      # Required for the workflow to read its own run metadata on private repos.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only Go today. If a JS/TS console is ever added to this repository,
+        # add it here rather than creating a second workflow.
+        language: [go]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # security-extended trades precision for recall. Worth it on a
+          # service that parses untrusted JWTs, proxies upstream JSON and
+          # builds cache keys from request input.
+          queries: security-extended,security-and-quality
+          config: |
+            paths-ignore:
+              # Generated protobuf stubs: findings there belong upstream.
+              - internal/datasource/operational/opsv1
+              - third_party
+              - deploy
+              - docs
+            paths:
+              - cmd
+              - internal
+              - pkg
+              - test
+
+      # An explicit build rather than the autobuilder: it reuses the module
+      # cache, builds the integration and contract tags so those files are
+      # analysed too, and fails loudly instead of silently analysing nothing.
+      - name: Build
+        run: |
+          go build ./...
+          go vet -tags=integration,contract ./... || true
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          # Upload even when queries fail, so partial results are still triaged.
+          upload: always

@@ -1,0 +1,87 @@
+# HorizontalPodAutoscaler for the BFF.
+#
+# Two signals drive scaling:
+#
+#   1. CPU utilisation — the general-purpose signal. 70% of the 250m request
+#      (deployment.yaml) leaves headroom for the burst a scale-up takes to
+#      absorb.
+#
+#   2. bff_concurrent_requests — the contract's UpDownCounter (design contract
+#      §7). This is the better signal for a BFF: concurrency rises the moment
+#      an upstream slows down, well before CPU does, because the extra load is
+#      goroutines parked on I/O rather than cycles burned. Scaling on it adds
+#      capacity while requests are queuing instead of after they start timing
+#      out.
+#
+# The custom metric requires prometheus-adapter (or KEDA) publishing
+# `bff_concurrent_requests` through custom.metrics.k8s.io. Verify with:
+#
+#   kubectl get --raw \
+#     "/apis/custom.metrics.k8s.io/v1beta1/namespaces/bff/pods/*/bff_concurrent_requests"
+#
+# HPA takes the MAXIMUM desired replica count across all metrics, so either
+# signal alone can scale up; both must be below target to scale down.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ttl-aware-bff
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/component: bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ttl-aware-bff
+
+  # minReplicas matches the Deployment baseline and keeps the PDB satisfiable
+  # (pdb.yaml allows one voluntary disruption at a time).
+  minReplicas: 3
+  maxReplicas: 30
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # In-flight requests per pod, averaged across the fleet. 40 is roughly 60%
+    # of the combined bulkhead capacity configured in bff.yaml
+    # (operational max_concurrent 64 + execution 32), so the autoscaler reacts
+    # before the bulkheads start rejecting.
+    - type: Pods
+      pods:
+        metric:
+          name: bff_concurrent_requests
+        target:
+          type: AverageValue
+          averageValue: "40"
+
+  behavior:
+    scaleUp:
+      # React quickly: a latency event needs capacity now, and over-provisioning
+      # for a few minutes is far cheaper than shedding traffic.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100      # allow doubling
+          periodSeconds: 30
+        - type: Pods
+          value: 4        # ...but never more than 4 pods per 30s
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Slow and cautious: five minutes of sustained low load before shrinking,
+      # so a lull between traffic waves does not cause flapping.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Min

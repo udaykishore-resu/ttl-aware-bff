@@ -1,0 +1,113 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+Ingress, fronted by an AWS Application Load Balancer via the AWS Load Balancer
+Controller (v2.7+).
+
+Only the public API path is routed. The admin port carries /metrics and the
+probes; it appears in no rule here and is restricted to the monitoring
+namespaces by networkpolicy.yaml.
+*/}}
+{{- $alb := .Values.ingress.alb -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "ttl-aware-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+  annotations:
+    # --- Load balancer shape ------------------------------------------
+    alb.ingress.kubernetes.io/scheme: {{ $alb.scheme }}
+    # `ip` mode registers pod IPs directly: one fewer hop than `instance` mode,
+    # and it makes the ALB's own health check the signal that the preStop drain
+    # relies on.
+    alb.ingress.kubernetes.io/target-type: {{ $alb.targetType }}
+    alb.ingress.kubernetes.io/group.name: {{ $alb.groupName }}
+    alb.ingress.kubernetes.io/group.order: {{ $alb.groupOrder | quote }}
+    alb.ingress.kubernetes.io/load-balancer-name: {{ $alb.loadBalancerName }}
+
+    # --- Listeners and TLS ---------------------------------------------
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    {{- with $alb.certificateArn }}
+    alb.ingress.kubernetes.io/certificate-arn: {{ . | quote }}
+    {{- end }}
+    alb.ingress.kubernetes.io/ssl-policy: {{ $alb.sslPolicy }}
+    # Plaintext requests are 301'd by the listener, so the BFF never sees one.
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+
+    # --- Health checks --------------------------------------------------
+    # Probes the ADMIN port, matching the kubelet's readinessProbe, so the ALB
+    # and the kubelet agree on when a pod may take traffic.
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-port: {{ $alb.healthcheck.port | quote }}
+    alb.ingress.kubernetes.io/healthcheck-path: {{ $alb.healthcheck.path }}
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: {{ $alb.healthcheck.intervalSeconds | quote }}
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: {{ $alb.healthcheck.timeoutSeconds | quote }}
+    alb.ingress.kubernetes.io/healthy-threshold-count: {{ $alb.healthcheck.healthyThreshold | quote }}
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: {{ $alb.healthcheck.unhealthyThreshold | quote }}
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # --- Target group ---------------------------------------------------
+    # deregistration_delay must be >= terminationGracePeriodSeconds
+    # ({{ .Values.terminationGracePeriodSeconds }}s) or the ALB stops draining
+    # before the pod has finished serving in-flight requests.
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      deregistration_delay.timeout_seconds={{ $alb.deregistrationDelaySeconds }},
+      load_balancing.algorithm.type=least_outstanding_requests,
+      stickiness.enabled=false
+
+    # --- Load balancer attributes ---------------------------------------
+    # Idle timeout above the BFF's write_timeout plus the slowest fan-out, so
+    # the ALB is never the component that truncates a response.
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      idle_timeout.timeout_seconds={{ $alb.idleTimeoutSeconds }},
+      routing.http2.enabled=true,
+      routing.http.drop_invalid_header_fields.enabled=true
+      {{- if $alb.accessLogsBucket -}}
+      ,access_logs.s3.enabled=true,access_logs.s3.bucket={{ $alb.accessLogsBucket }},access_logs.s3.prefix=bff
+      {{- end }}
+
+    # --- WAF / Shield ----------------------------------------------------
+    {{- with $alb.wafAclArn }}
+    alb.ingress.kubernetes.io/wafv2-acl-arn: {{ . | quote }}
+    {{- end }}
+    alb.ingress.kubernetes.io/shield-advanced-protection: {{ $alb.shieldAdvanced | quote }}
+
+    # --- Tags mirrored onto every AWS resource the controller creates ----
+    alb.ingress.kubernetes.io/tags: >-
+      Project=ttl-aware-bff,
+      Component=bff,
+      Environment={{ .Values.otel.environment }},
+      ManagedBy=aws-load-balancer-controller
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- /* Merged last so a values file can always win. */}}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    # The ALB terminates TLS with certificate-arn above; this block records the
+    # intent in the manifest and keeps any other controller behaving the same.
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # Only the API prefix is published. A request to /metrics or /readyz
+          # through the ALB gets a 404 from the listener, never reaching a pod.
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ include "ttl-aware-bff.fullname" . }}
+                port:
+                  name: http
+{{- end }}

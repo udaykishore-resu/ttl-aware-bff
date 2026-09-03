@@ -1,0 +1,40 @@
+%% C4 level 2 — containers and processes.
+%% Source of truth: docker-compose.yaml, docs/DESIGN-CONTRACT.md §1 and §9,
+%% configs/bff.yaml (cache backend, source addresses, OTLP endpoint).
+C4Container
+    title Container view — the deployable units and what they speak
+
+    Person(operator, "Operations console user")
+
+    System_Boundary(sys, "ttl-aware-bff deployment") {
+        Container(api, "BFF public API", "Go, net/http :8080", "Six GET routes under /api/v1. Auth, rate limit, body limit, request timeout, correlation, access log.")
+        Container(admin, "BFF admin listener", "Go, net/http :9090", "/livez /readyz /healthz /metrics /buildinfo /config/routing. Unauthenticated, never exposed through the ingress.")
+        ContainerDb(l1, "L1 cache", "in-process map, max_entries 20000, ttl 2s", "Per-replica. Holds cache.Entry values.")
+        ContainerDb(l2, "L2 cache", "Redis 7", "Shared across replicas. Physical lifetime = cache_ttl + stale_grace (5m).")
+    }
+
+    System_Boundary(sources, "Reference data sources (compose stack)") {
+        Container(ods, "opsource", "Go, gRPC :9101, admin :9111", "Operational Data Source stub. 50 seeded resources R001..R050. Chaos knobs: latency, failure_rate, unavailable, probe_unavailable, stale_by, clock_skew, partial, schema_version.")
+        Container(eds, "exsource", "Go, REST :9102, admin :9112", "Execution Data Source stub. 120ms base latency by default. Chaos knobs: base_latency, jitter, failure_rate, unavailable, malformed, schema_version.")
+    }
+
+    System_Boundary(obs, "Telemetry") {
+        Container(collector, "otel-collector", "otel/opentelemetry-collector-contrib", "OTLP :4317 in; Prometheus exporter :8889 out.")
+        ContainerDb(jaeger, "jaeger", "all-in-one, UI :16686", "Trace storage.")
+        ContainerDb(prom, "prometheus", "UI :9091 on the host", "Scrapes the collector and the BFF admin port.")
+        Container(grafana, "grafana", "UI :3000", "Dashboards over Prometheus and Jaeger.")
+    }
+
+    Rel(operator, api, "GET /api/v1/resources/{id}/...", "HTTPS + JWT, X-Tenant-ID")
+    Rel(api, l1, "Get / Set / GetStale")
+    Rel(api, l2, "Get / Set / GetStale, stampede lock")
+    Rel(api, ods, "freshness probe, then narrow or full read", "gRPC, call_timeout 400ms, probe 120ms")
+    Rel(api, eds, "latest-execution, executions", "HTTP, call_timeout 2s")
+    Rel(api, collector, "spans + metrics", "OTLP/gRPC")
+    Rel(admin, prom, "scraped on /metrics", "HTTP")
+    Rel(collector, jaeger, "spans", "OTLP")
+    Rel(prom, collector, "scrape :8889", "HTTP")
+    Rel(grafana, prom, "PromQL", "HTTP")
+    Rel(grafana, jaeger, "trace lookup", "HTTP")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="2")

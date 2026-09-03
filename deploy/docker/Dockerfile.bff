@@ -1,0 +1,140 @@
+# syntax=docker/dockerfile:1.7
+#
+# ttl-aware-bff — the BFF itself (cmd/bff).
+#
+# Build context is the REPOSITORY ROOT, not this directory:
+#
+#   docker build -f deploy/docker/Dockerfile.bff \
+#     --build-arg VERSION="$(git describe --tags --always --dirty)" \
+#     --build-arg COMMIT="$(git rev-parse --short HEAD)" \
+#     --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+#     -t ghcr.io/udaykishore/ttl-aware-bff:dev .
+#
+# Runtime contract (docs/DESIGN-CONTRACT.md §1):
+#   8080  public HTTP API   (/api/v1/...)
+#   9090  admin HTTP        (/healthz, /readyz, /livez, /metrics)
+#
+# There is deliberately NO HEALTHCHECK instruction. Kubernetes owns liveness and
+# readiness via startupProbe/readinessProbe/livenessProbe against :9090, and a
+# Docker-level healthcheck would only duplicate that signal (and force a probe
+# tool into an image that intentionally has none). docker-compose.yaml declares
+# its own healthchecks for local use, where there is no kubelet.
+
+# ---------------------------------------------------------------------------
+# Stage 1: build
+# ---------------------------------------------------------------------------
+ARG GO_VERSION=1.24
+FROM golang:${GO_VERSION}-bookworm AS build
+
+# GOFLAGS is exposed as a build ARG so the same Dockerfile works in restricted
+# environments. In a normal environment leave it empty and `go mod download`
+# resolves through proxy.golang.org.
+#
+# Offline / air-gapped path: this repository's go.mod carries a `replace` block
+# redirecting vanity module paths to their GitHub mirrors for hosts that cannot
+# reach proxy.golang.org. Nothing below depends on that block. If you need to
+# build without the public proxy, vendor first (`go mod vendor`) and pass:
+#
+#   --build-arg GOFLAGS=-mod=vendor
+#
+# which makes the `go mod download` layer a no-op and the compile read
+# ./vendor. Alternatively point GOPROXY at an internal Athens/JFrog mirror.
+ARG GOFLAGS=""
+ENV GOFLAGS=${GOFLAGS}
+
+# Fully static, reproducible binaries. CGO off means no glibc at runtime, which
+# is what lets the final stage be distroless/static.
+ENV CGO_ENABLED=0 \
+    GOOS=linux \
+    GOTOOLCHAIN=local
+
+WORKDIR /src
+
+# --- Layer ordering ---------------------------------------------------------
+# go.mod/go.sum change far less often than source, so they are copied first and
+# the module download is cached independently of the code. Combined with the
+# BuildKit cache mounts below, an incremental build recompiles only what moved.
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download all
+
+# Now the source. .dockerignore keeps deploy/, docs/, .git/ and friends out of
+# the context so edits to manifests never invalidate this layer.
+COPY . .
+
+# Version metadata injected into the binary's `main` package. Keep these three
+# variable names in sync with cmd/bff/main.go.
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=1970-01-01T00:00:00Z
+ARG TARGETOS
+ARG TARGETARCH
+
+# -trimpath strips absolute build paths (reproducibility + no host leakage).
+# -s -w drops the symbol table and DWARF: ~30% smaller, still panics with a
+# usable goroutine stack.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build \
+      -trimpath \
+      -tags osusergo,netgo \
+      -ldflags="-s -w \
+        -X main.version=${VERSION} \
+        -X main.commit=${COMMIT} \
+        -X main.buildDate=${BUILD_DATE}" \
+      -o /out/bff \
+      ./cmd/bff
+
+# The default config ships in the image so the container is runnable with no
+# mounts. In Kubernetes it is shadowed by the ConfigMap mount at /etc/bff.
+RUN cp configs/bff.yaml /out/bff.yaml
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime
+# ---------------------------------------------------------------------------
+# distroless/static-debian12 contains only CA certificates, /etc/passwd,
+# tzdata and a nonroot user. No shell, no package manager, no libc.
+# The :nonroot tag sets USER 65532:65532 already; it is restated below so the
+# intent survives a base-image bump.
+#
+# RUNTIME_IMAGE is an ARG purely so LOCAL development can swap in the official
+# `debug-nonroot` variant, which is the same image plus busybox at /busybox.
+# docker-compose.yaml uses that variant so compose healthchecks have a wget to
+# call; CI and production builds must leave this at the default.
+#
+#   --build-arg RUNTIME_IMAGE=gcr.io/distroless/static-debian12:debug-nonroot
+ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
+FROM ${RUNTIME_IMAGE} AS runtime
+
+# --- OCI image annotations (opencontainers.org/spec/image-spec) -------------
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=1970-01-01T00:00:00Z
+ARG RUNTIME_IMAGE
+LABEL org.opencontainers.image.title="ttl-aware-bff" \
+      org.opencontainers.image.description="TTL-aware Backend-for-Frontend routing between an operational (gRPC) and an execution (REST) data source." \
+      org.opencontainers.image.source="https://github.com/udaykishore/ttl-aware-bff" \
+      org.opencontainers.image.documentation="https://github.com/udaykishore/ttl-aware-bff/blob/main/docs/DESIGN-CONTRACT.md" \
+      org.opencontainers.image.url="https://github.com/udaykishore/ttl-aware-bff" \
+      org.opencontainers.image.vendor="udaykishore" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.base.name="${RUNTIME_IMAGE}"
+
+COPY --from=build /out/bff /usr/local/bin/bff
+COPY --from=build /out/bff.yaml /etc/bff/bff.yaml
+
+# 65532 is distroless' `nonroot` user. Declared numerically so Kubernetes'
+# runAsNonRoot admission check can verify it without resolving /etc/passwd.
+USER 65532:65532
+
+# Documentation only — publishing is decided by the orchestrator.
+EXPOSE 8080 9090
+
+# The binary is PID 1 and receives SIGTERM directly; there is no shell in the
+# image to swallow it. Graceful drain is server.shutdown_grace in bff.yaml.
+ENTRYPOINT ["/usr/local/bin/bff"]
+CMD ["--config", "/etc/bff/bff.yaml"]

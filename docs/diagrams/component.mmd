@@ -1,0 +1,116 @@
+%% C4 level 3 — internal packages and the direction of every import edge.
+%% Generated from the actual import sets of internal/**; every arrow below is a
+%% real dependency and no arrow is missing. Arrows point from importer to
+%% imported: A --> B means "A imports B".
+flowchart TB
+    subgraph transport["transport — knows HTTP, knows nothing about sources"]
+        api["api<br/>server, routes, admin"]
+        handler["api/handler"]
+        mw["api/middleware"]
+        resp["api/response"]
+    end
+
+    subgraph orchestration["orchestration — the only place the pieces meet"]
+        app["application<br/>application.Service"]
+    end
+
+    subgraph policyLayer["policy — pure decisions, no I/O"]
+        cls["classifier"]
+        rt["router"]
+        pol["policy<br/>precedence + field catalog"]
+        fr["freshness"]
+    end
+
+    subgraph plumbing["plumbing"]
+        agg["aggregation"]
+        ca["cache"]
+        ds["datasource<br/>ports + adapters"]
+        map["mapper"]
+        res["resilience"]
+        sec["security"]
+    end
+
+    subgraph foundation["foundation — depended on, depends on nothing internal"]
+        dom["domain"]
+        cfg["config"]
+        obs["observability"]
+        errs["pkg/errs"]
+        corr["pkg/correlation"]
+        opsv1["datasource/operational/opsv1<br/>generated gRPC stubs"]
+    end
+
+    api --> handler
+    api --> mw
+    api --> resp
+    api --> app
+    api --> cls
+    api --> sec
+    api --> res
+    api --> obs
+    api --> cfg
+    api --> dom
+    api --> errs
+    api --> corr
+
+    app --> rt
+    app --> cls
+    app --> agg
+    app --> ca
+    app --> ds
+    app --> fr
+    app --> pol
+    app --> obs
+    app --> cfg
+    app --> dom
+    app --> errs
+    app --> corr
+
+    rt --> cls
+    rt --> fr
+    rt --> pol
+    rt --> cfg
+    rt --> dom
+
+    cls --> pol
+    cls --> cfg
+    cls --> errs
+
+    pol --> cfg
+    pol --> dom
+
+    fr --> ds
+    fr --> dom
+
+    agg --> ds
+    agg --> pol
+    agg --> dom
+    agg --> errs
+
+    ca --> cfg
+    ca --> dom
+
+    ds --> map
+    ds --> res
+    ds --> opsv1
+    ds --> cfg
+    ds --> dom
+    ds --> errs
+    ds --> corr
+
+    map --> opsv1
+    map --> dom
+    map --> errs
+
+    res --> cfg
+    res --> errs
+
+    sec --> cfg
+    sec --> errs
+
+    obs --> cfg
+    obs --> corr
+
+    classDef found fill:#eef2f7,stroke:#5b6b7f,color:#1b2733
+    classDef pure fill:#eef7ee,stroke:#4b7a4b,color:#1b2733
+    class dom,cfg,obs,errs,corr,opsv1 found
+    class cls,rt,pol,fr pure

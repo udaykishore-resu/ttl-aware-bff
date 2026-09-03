@@ -1,0 +1,138 @@
+# OpenTelemetry Collector (contrib distribution) — local stack configuration.
+#
+# Shape of the local telemetry path:
+#
+#   bff / opsource / exsource --OTLP gRPC :4317--> collector
+#                                                    |-- traces  --> jaeger (OTLP :4317)
+#                                                    |-- metrics --> prometheus exporter :8889 (scraped)
+#                                                    `-- logs    --> debug exporter (stdout)
+#
+# The BFF exports over OTLP/gRPC only (see observability.otlp.endpoint in
+# configs/bff.yaml, overridden in docker-compose.yaml via
+# BFF_OBSERVABILITY__OTLP__ENDPOINT=otel-collector:4317).
+#
+# This file is deliberately close to what you would run in a cluster as the
+# ADOT collector's config; the differences are the exporters (Jaeger/Prometheus
+# here, X-Ray/AMP in AWS — see deploy/terraform/modules/observability).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        # 0.0.0.0 so the listener is reachable from other compose services.
+        endpoint: 0.0.0.0:4317
+        # Local stack runs without TLS. The BFF is configured with
+        # observability.otlp.insecure=true to match.
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Scrapes the collector's own internal telemetry so the local Prometheus can
+  # show collector health (queue length, refused spans, exporter failures).
+  prometheus/internal:
+    config:
+      scrape_configs:
+        - job_name: otel-collector-internal
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+
+processors:
+  # memory_limiter MUST be first in every pipeline: it sheds load before the
+  # collector can OOM, which is the single most common collector failure.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+
+  # Batching is what makes OTLP export cheap. 200ms is a good local default;
+  # production ADOT typically uses 5s/8192.
+  batch:
+    timeout: 200ms
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  # Attributes every local signal so dashboards can distinguish this stack from
+  # a real environment. `deployment.environment` matches
+  # observability.environment in bff.yaml.
+  resource/local:
+    attributes:
+      - key: deployment.environment
+        value: local
+        action: upsert
+      - key: service.namespace
+        value: bff
+        action: upsert
+
+exporters:
+  # --- Traces -> Jaeger ------------------------------------------------------
+  # Jaeger all-in-one accepts OTLP natively since 1.35; there is no need for the
+  # deprecated jaeger exporter.
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # --- Metrics -> Prometheus scrape endpoint --------------------------------
+  # Exposes :8889/metrics; deploy/docker/prometheus.yml scrapes it.
+  # The BFF's instrument names (bff_request_total, operational_ttl_hit_total,
+  # bff_concurrent_requests, ...) are already Prometheus-shaped, so translation
+  # is left off to keep names identical to docs/DESIGN-CONTRACT.md §7.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: ""
+    send_timestamps: true
+    metric_expiration: 5m
+    resource_to_telemetry_conversion:
+      # Promotes resource attributes (service.name, deployment.environment) to
+      # labels so metrics can be filtered per service in Grafana.
+      enabled: true
+
+  # --- Logs / debugging ------------------------------------------------------
+  # `debug` replaced the old `logging` exporter. basic verbosity prints one line
+  # per batch; switch to `detailed` when chasing a missing attribute.
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  # Liveness for the compose healthcheck: GET :13133/ returns 200 when the
+  # collector's pipelines are running.
+  health_check:
+    endpoint: 0.0.0.0:13133
+  # pprof and zpages are invaluable when the collector itself misbehaves.
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/local, batch]
+      exporters: [otlp/jaeger]
+
+    metrics:
+      receivers: [otlp, prometheus/internal]
+      processors: [memory_limiter, resource/local, batch]
+      exporters: [prometheus]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/local, batch]
+      exporters: [debug]

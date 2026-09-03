@@ -1,0 +1,961 @@
+# Continuous integration and delivery for the TTL-aware BFF.
+#
+# The pipeline is a chain of gates, cheapest first, so a formatting mistake
+# fails in 40 seconds instead of after a container build:
+#
+#   lint ─┬─ test (race + coverage gate) ─┐
+#         ├─ security (gosec)             │
+#         ├─ sast (CodeQL)                ├─ build ─ container ─┬─ integration ─┐
+#         └─ deps (govulncheck + Trivy)   ┘                     └─ contract ────┤
+#                                                                              │
+#   publish (GHCR) ─ deploy-dev ─ smoke ─ deploy-staging ─ [approval] ─ deploy-prod
+#
+# Nothing after `container` runs on a pull request: PRs verify, they do not
+# deploy. That is enforced by the `if:` guard on `publish` and inherited by
+# everything downstream through `needs:`.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # Tags are handled by release.yaml, which does the multi-arch build and
+    # the GitHub Release. Excluding them here stops both pipelines racing to
+    # deploy the same commit.
+    tags-ignore: ["**"]
+  pull_request:
+    branches: [main]
+  # Manual re-runs, e.g. to redeploy after an infrastructure change.
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: "Deploy target for a manual run"
+        required: false
+        default: "dev"
+        type: choice
+        options: [dev, staging, none]
+
+# One in-flight run per ref. A new push cancels the previous run for the same
+# PR (nobody cares about results for a superseded commit) but NEVER for main:
+# cancelling a run mid-deploy is how you get a half-deployed fleet.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Default to read-only. Every job that needs more asks for it explicitly, so
+# an added job cannot silently inherit write access to the repository.
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+  GOLANGCI_LINT_VERSION: "v1.62.2"
+  REGISTRY: ghcr.io
+  IMAGE_BFF: ghcr.io/${{ github.repository_owner }}/ttl-aware-bff
+  IMAGE_OPSOURCE: ghcr.io/${{ github.repository_owner }}/ttl-aware-bff-opsource
+  IMAGE_EXSOURCE: ghcr.io/${{ github.repository_owner }}/ttl-aware-bff-exsource
+  # Coverage floor. Raise it as coverage improves; never lower it to make a
+  # red build green.
+  COVERAGE_THRESHOLD: "75.0"
+
+jobs:
+  # =========================================================================
+  # 1. LINT — formatting, vet, golangci-lint
+  # =========================================================================
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # setup-go's built-in cache keys off go.sum, which is exactly right
+          # for a single-module repository.
+          cache: true
+          cache-dependency-path: go.sum
+
+      # gofmt before anything else: it is the fastest possible failure and the
+      # easiest possible fix. `gofmt -l` lists offending files and exits 0, so
+      # the output has to be tested explicitly.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l -s . | grep -v '^third_party/' || true)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error::These files are not gofmt-clean. Run 'make fmt'."
+            echo "${unformatted}"
+            gofmt -d -s ${unformatted}
+            exit 1
+          fi
+          echo "All files are gofmt-clean."
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          # Full tree, not just the diff: --new-from-rev would let existing
+          # problems accumulate behind the gate.
+          args: --config=.golangci.yaml --timeout=5m
+          # The action manages its own cache; setup-go already handles modules.
+          skip-cache: false
+
+  # =========================================================================
+  # 2. UNIT TESTS — race detector and a coverage gate
+  # =========================================================================
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      # -race is non-negotiable for this service: the aggregation fan-out, the
+      # singleflight cache and the circuit breakers are all concurrent, and a
+      # data race there is invisible without it.
+      - name: go test -race
+        run: |
+          go test \
+            -race \
+            -shuffle=on \
+            -covermode=atomic \
+            -coverprofile=coverage.out \
+            -coverpkg=./internal/...,./pkg/... \
+            -timeout=10m \
+            ./...
+
+      - name: Coverage report
+        run: |
+          go tool cover -func=coverage.out | tee coverage.txt
+          go tool cover -html=coverage.out -o coverage.html
+
+      - name: Coverage gate
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')"
+          echo "Total coverage: ${total}% (threshold ${COVERAGE_THRESHOLD}%)"
+          # awk rather than bash arithmetic: these are floats.
+          if awk -v t="${total}" -v m="${COVERAGE_THRESHOLD}" 'BEGIN { exit (t >= m) ? 0 : 1 }'; then
+            echo "::notice::Coverage ${total}% meets the ${COVERAGE_THRESHOLD}% threshold."
+          else
+            echo "::error::Coverage ${total}% is below the ${COVERAGE_THRESHOLD}% threshold."
+            exit 1
+          fi
+          {
+            echo "### Coverage"
+            echo ""
+            echo "Total: **${total}%** (threshold ${COVERAGE_THRESHOLD}%)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/upload-artifact@v4
+        # Upload even on failure: a coverage report is most useful when the
+        # gate just rejected the build.
+        if: always()
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.txt
+            coverage.html
+          retention-days: 14
+
+  # =========================================================================
+  # 3. SECURITY SCAN — gosec
+  # =========================================================================
+  security:
+    name: Security scan (gosec)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [lint]
+    permissions:
+      contents: read
+      # Required to upload the SARIF report to the Security tab.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run gosec
+        uses: securego/gosec@master
+        with:
+          # -no-fail: findings are reported through SARIF and triaged in the
+          # Security tab rather than blocking the build on a medium-confidence
+          # heuristic. Genuinely dangerous patterns are caught by the gosec
+          # rules enabled in .golangci.yaml, which DO fail the lint job.
+          args: >-
+            -no-fail
+            -fmt=sarif
+            -out=gosec.sarif
+            -exclude-dir=third_party
+            -exclude-dir=deploy
+            ./...
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+  # =========================================================================
+  # 4. SAST — CodeQL
+  # =========================================================================
+  # Duplicated from codeql.yaml on purpose: that workflow runs on a schedule to
+  # catch newly published queries against unchanged code, while this job gates
+  # the change in front of you.
+  sast:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [lint]
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          # security-extended adds the lower-precision queries. Worth the noise
+          # on a service that parses untrusted JWTs and proxies upstream data.
+          queries: security-extended,security-and-quality
+
+      # Manual build: CodeQL's autobuilder works, but an explicit build shares
+      # the module cache with the rest of the pipeline and fails loudly.
+      - name: Build
+        run: go build ./...
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:go
+
+  # =========================================================================
+  # 5. DEPENDENCY SCAN — govulncheck and Trivy filesystem
+  # =========================================================================
+  deps:
+    name: Dependency scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [lint]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      # govulncheck is the precise one: it reports only vulnerabilities in code
+      # paths this binary actually reaches, so a finding is nearly always real.
+      # It therefore FAILS the build.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck -show verbose ./...
+
+      # Trivy fs is the broad one: it flags every vulnerable module version in
+      # go.sum whether or not the code is reachable. Reported, not enforced,
+      # because blocking on unreachable CVEs trains people to bypass the gate.
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+          skip-dirs: third_party,deploy
+        env:
+          # The public DB endpoint is rate-limited; these mirrors are the
+          # documented workaround for CI.
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
+          TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db:1
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # =========================================================================
+  # 6. BUILD — compile every binary for every target platform
+  # =========================================================================
+  build:
+    name: Build ${{ matrix.binary }} (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [test, security, deps]
+    strategy:
+      fail-fast: false
+      matrix:
+        binary: [bff, opsource, exsource]
+        goos: [linux]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `git describe` needs the tag history.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="$(git describe --tags --always --dirty)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Same flags as the Dockerfiles, so what CI proves compiles is what
+          # the image contains.
+          go build \
+            -trimpath \
+            -tags osusergo,netgo \
+            -ldflags="-s -w \
+              -X main.version=${VERSION} \
+              -X main.commit=${COMMIT} \
+              -X main.buildDate=${BUILD_DATE}" \
+            -o "bin/${{ matrix.binary }}-${{ matrix.goos }}-${{ matrix.goarch }}" \
+            "./cmd/${{ matrix.binary }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.binary }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/
+          retention-days: 7
+
+  # =========================================================================
+  # 7. CONTAINER — build, scan, SBOM, sign
+  # =========================================================================
+  container:
+    name: Container ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [build]
+    permissions:
+      contents: read
+      # Push to GHCR.
+      packages: write
+      # Keyless cosign signing (Sigstore/Fulcio OIDC).
+      id-token: write
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ttl-aware-bff
+            dockerfile: deploy/docker/Dockerfile.bff
+          - image: ttl-aware-bff-opsource
+            dockerfile: deploy/docker/Dockerfile.opsource
+          - image: ttl-aware-bff-exsource
+            dockerfile: deploy/docker/Dockerfile.exsource
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only log in when there is something to push. A PR from a fork has no
+      # package write permission anyway.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # Multi-arch on main; amd64 only on a PR, where the arm64 build costs
+          # several minutes of QEMU emulation for no additional signal.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          # A PR build is loaded into the local daemon so Trivy can scan it.
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            GO_VERSION=${{ env.GO_VERSION }}
+          # GitHub's own build cache: survives between runs, scoped per image so
+          # three parallel matrix legs do not evict each other.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+          provenance: true
+          sbom: true
+
+      # --- Vulnerability scan ------------------------------------------
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-image-${{ matrix.image }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          # distroless/static carries almost nothing, so a finding here is
+          # nearly always in our own Go dependencies and worth acting on.
+          vuln-type: os,library
+        env:
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
+
+      - name: Upload image SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image-${{ matrix.image }}.sarif
+          category: trivy-image-${{ matrix.image }}
+
+      # A second Trivy pass that FAILS on a fixable critical. The SARIF upload
+      # above is for triage; this is the gate.
+      - name: Trivy gate (critical, fixable)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:sha-${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+        env:
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
+
+      # --- SBOM ----------------------------------------------------------
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:sha-${{ github.sha }}
+          format: spdx-json
+          artifact-name: sbom-${{ matrix.image }}.spdx.json
+          output-file: sbom-${{ matrix.image }}.spdx.json
+          upload-artifact: true
+
+      # --- Signing --------------------------------------------------------
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image and attach SBOM
+        if: github.event_name != 'pull_request'
+        env:
+          # Keyless: identity comes from the workflow's OIDC token and the
+          # signature is recorded in the Rekor transparency log. No private key
+          # to store, rotate or leak.
+          COSIGN_EXPERIMENTAL: "1"
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          # Always sign by DIGEST. Signing a tag signs a moving target.
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+          # Attach the SBOM as a signed attestation, so a consumer can verify
+          # both what the image is and what is in it.
+          cosign attest --yes \
+            --predicate "sbom-${{ matrix.image }}.spdx.json" \
+            --type spdxjson \
+            "${IMAGE}@${DIGEST}"
+
+          {
+            echo "### Signed ${{ matrix.image }}"
+            echo ""
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo ""
+            echo "Verify with:"
+            echo '```'
+            echo "cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "  --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.github/workflows/.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # =========================================================================
+  # 8. INTEGRATION TESTS — the real stack, via docker compose
+  # =========================================================================
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [container]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Compose builds the three Go images locally with the debug-nonroot base
+      # so its healthchecks work. Rebuilding here rather than pulling the
+      # pushed image is deliberate: it exercises the Dockerfiles themselves.
+      - name: Start the stack
+        run: |
+          docker compose up --build --detach --wait --wait-timeout 300
+          docker compose ps
+
+      - name: Wait for readiness
+        run: |
+          # --wait already gates on the healthchecks; this re-checks from
+          # OUTSIDE the container network, which is how the tests will connect.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9090/readyz >/dev/null 2>&1; then
+              echo "BFF ready after ${i} attempt(s)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::BFF never became ready."
+          docker compose logs --no-color
+          exit 1
+
+      - name: Run integration tests
+        env:
+          # The suite reads these rather than hardcoding ports.
+          BFF_TEST_API_URL: http://127.0.0.1:8080
+          BFF_TEST_ADMIN_URL: http://127.0.0.1:9090
+          BFF_TEST_OPSOURCE_ADMIN_URL: http://127.0.0.1:9111
+          BFF_TEST_EXSOURCE_ADMIN_URL: http://127.0.0.1:9112
+          BFF_TEST_REDIS_ADDR: 127.0.0.1:6379
+          BFF_TEST_JAEGER_URL: http://127.0.0.1:16686
+        run: |
+          go test -v -count=1 -timeout=20m \
+            -tags=integration \
+            ./test/integration/...
+
+      # Logs are worth far more than the exit code when this fails.
+      - name: Collect stack logs
+        if: failure()
+        run: |
+          mkdir -p compose-logs
+          for svc in $(docker compose config --services); do
+            docker compose logs --no-color --timestamps "${svc}" > "compose-logs/${svc}.log" 2>&1 || true
+          done
+          docker compose ps --all > compose-logs/ps.txt 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: integration-compose-logs
+          path: compose-logs/
+          retention-days: 7
+
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  # =========================================================================
+  # 9. CONTRACT TESTS — the API envelope and the OpenAPI/proto schemas
+  # =========================================================================
+  # Separate from the integration suite because it answers a different
+  # question: integration asks "does it work", contract asks "does it still
+  # match what consumers were promised" (design contract sections 3 and 5).
+  contract:
+    name: Contract tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [container]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The contract suite exercises the API surface, so it needs the BFF and
+      # its two sources but not the observability half of the stack.
+      - name: Start the stack
+        run: |
+          docker compose up --build --detach --wait --wait-timeout 300 \
+            redis opsource exsource otel-collector jaeger bff
+
+      - name: Run contract tests
+        env:
+          BFF_TEST_API_URL: http://127.0.0.1:8080
+          BFF_TEST_ADMIN_URL: http://127.0.0.1:9090
+        run: |
+          go test -v -count=1 -timeout=15m \
+            -tags=contract \
+            ./test/contract/...
+
+      - name: Collect stack logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps > contract-logs.txt 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: contract-compose-logs
+          path: contract-logs.txt
+          retention-days: 7
+
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  # =========================================================================
+  # 10. PUBLISH — promote the verified image
+  # =========================================================================
+  # The image was pushed by the `container` job with an immutable sha- tag.
+  # This job adds the moving tags (`main`, `latest`) only after integration and
+  # contract tests have passed against it, so `latest` always means "verified".
+  publish:
+    name: Publish to GHCR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [integration, contract]
+    # The gate that keeps PRs out of the registry and out of every deploy job
+    # below, which all depend on this one.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tag
+        id: tag
+        run: echo "tag=sha-${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+
+      # `docker buildx imagetools create` re-points a tag at an existing
+      # manifest without pulling or rebuilding, so the promoted image is
+      # bit-identical to the one that was tested and signed.
+      - name: Promote verified images
+        run: |
+          for image in ttl-aware-bff ttl-aware-bff-opsource ttl-aware-bff-exsource; do
+            src="${REGISTRY}/${{ github.repository_owner }}/${image}:sha-${GITHUB_SHA}"
+            echo "Promoting ${src}"
+            docker buildx imagetools create \
+              --tag "${REGISTRY}/${{ github.repository_owner }}/${image}:main" \
+              --tag "${REGISTRY}/${{ github.repository_owner }}/${image}:latest" \
+              "${src}"
+          done
+
+  # =========================================================================
+  # 11. DEPLOY DEV
+  # =========================================================================
+  deploy-dev:
+    name: Deploy to dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [publish]
+    if: github.event_name == 'push' || github.event.inputs.deploy_environment != 'none'
+    environment:
+      name: dev
+      url: https://bff.dev.example.com
+    permissions:
+      contents: read
+      # OIDC federation into AWS: no long-lived access keys in secrets.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_DEV }}
+          aws-region: us-east-1
+          role-session-name: gha-deploy-dev-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ttl-aware-bff-dev-eks \
+            --region us-east-1
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install bff deploy/helm/ttl-aware-bff \
+            --namespace bff \
+            --create-namespace \
+            --values deploy/helm/ttl-aware-bff/values-dev.yaml \
+            --set image.tag="sha-${GITHUB_SHA}" \
+            --set otel.environment=dev \
+            --atomic \
+            --timeout 10m \
+            --wait
+
+      - name: Show rollout
+        run: |
+          kubectl -n bff rollout status deployment/ttl-aware-bff --timeout=5m
+          kubectl -n bff get pods -l app.kubernetes.io/instance=bff -o wide
+
+      - name: Helm test
+        run: helm test bff --namespace bff --timeout 5m
+
+  # =========================================================================
+  # 12. SMOKE TEST — prove dev actually serves traffic
+  # =========================================================================
+  smoke:
+    name: Smoke test (dev)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [deploy-dev]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_DEV }}
+          aws-region: us-east-1
+          role-session-name: gha-smoke-dev-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ttl-aware-bff-dev-eks --region us-east-1
+
+      # Port-forward rather than going through the ALB: this checks the
+      # deployment, not DNS propagation or the WAF.
+      - name: Port-forward the admin port
+        run: |
+          kubectl -n bff port-forward svc/ttl-aware-bff 9090:9090 &
+          echo $! > /tmp/pf.pid
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:9090/livez >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+      - name: Smoke checks
+        run: |
+          set -euo pipefail
+
+          echo "==> /livez"
+          curl -fsS --max-time 10 http://127.0.0.1:9090/livez
+
+          echo "==> /readyz"
+          curl -fsS --max-time 10 http://127.0.0.1:9090/readyz
+
+          echo "==> /metrics carries the contract instruments"
+          metrics="$(curl -fsS --max-time 10 http://127.0.0.1:9090/metrics)"
+          for m in bff_request_total bff_concurrent_requests routing_decision_total cache_hit_total; do
+            echo "${metrics}" | grep -q "${m}" \
+              || { echo "::error::metric ${m} missing from /metrics"; exit 1; }
+            echo "    ${m} present"
+          done
+
+          echo "==> deployed version"
+          echo "${metrics}" | grep -E '^bff_build_info|service_version' || true
+
+      - name: Stop port-forward
+        if: always()
+        run: kill "$(cat /tmp/pf.pid)" 2>/dev/null || true
+
+  # =========================================================================
+  # 13. DEPLOY STAGING
+  # =========================================================================
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [smoke]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://bff.staging.example.com
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_STAGING }}
+          aws-region: us-east-1
+          role-session-name: gha-deploy-staging-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ttl-aware-bff-staging-eks --region us-east-1
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install bff deploy/helm/ttl-aware-bff \
+            --namespace bff \
+            --create-namespace \
+            --values deploy/helm/ttl-aware-bff/values-prod.yaml \
+            --set image.tag="sha-${GITHUB_SHA}" \
+            --set otel.environment=staging \
+            --set ingress.host=bff.staging.example.com \
+            --set autoscaling.minReplicas=3 \
+            --set autoscaling.maxReplicas=12 \
+            --atomic \
+            --timeout 10m \
+            --wait
+
+      - name: Verify
+        run: |
+          kubectl -n bff rollout status deployment/ttl-aware-bff --timeout=5m
+          helm test bff --namespace bff --timeout 5m
+
+  # =========================================================================
+  # 14. PRODUCTION — behind a manual approval gate
+  # =========================================================================
+  # The gate is the `production` GitHub Environment, which must be configured
+  # with required reviewers. Nothing in this file can enforce that; the
+  # environment's protection rules are what actually pause the run.
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: [deploy-staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://bff.example.com
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_PROD }}
+          aws-region: us-east-1
+          role-session-name: gha-deploy-prod-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ttl-aware-bff-prod-eks --region us-east-1
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Verify before deploying, not after. A signature that is only checked
+      # post-hoc protects nothing.
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            "${IMAGE_BFF}:sha-${GITHUB_SHA}" \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/.*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Resolve image digest
+        id: digest
+        run: |
+          # Deploy by digest, never by tag: the tag could be moved between the
+          # verification above and the rollout below.
+          digest="$(cosign triangulate --type digest "${IMAGE_BFF}:sha-${GITHUB_SHA}")"
+          echo "digest=${digest#*@}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved to ${digest}"
+
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install bff deploy/helm/ttl-aware-bff \
+            --namespace bff \
+            --create-namespace \
+            --values deploy/helm/ttl-aware-bff/values-prod.yaml \
+            --set image.tag="" \
+            --set image.digest="${{ steps.digest.outputs.digest }}" \
+            --atomic \
+            --timeout 15m \
+            --wait
+
+      - name: Verify rollout
+        run: |
+          kubectl -n bff rollout status deployment/ttl-aware-bff --timeout=10m
+          kubectl -n bff get pods -l app.kubernetes.io/instance=bff -o wide
+          helm test bff --namespace bff --timeout 5m
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed to production"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Digest | \`${{ steps.digest.outputs.digest }}\` |"
+            echo "| URL | https://bff.example.com |"
+          } >> "${GITHUB_STEP_SUMMARY}"

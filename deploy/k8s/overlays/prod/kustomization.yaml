@@ -1,0 +1,163 @@
+# Production overlay.
+#
+#   kubectl apply -k deploy/k8s/overlays/prod
+#
+# The base is already production-shaped, so this overlay mostly pins the things
+# that are environment-specific — account ids, hostnames, the ElastiCache
+# endpoint — and tightens the few knobs that should be stricter than the base:
+# a higher HPA floor, harder anti-affinity, low trace sampling.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: bff
+
+resources:
+  - ../../
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/environment: prod
+
+commonAnnotations:
+  bff.internal/environment: prod
+
+images:
+  - name: ghcr.io/udaykishore/ttl-aware-bff
+    # CI rewrites this to the immutable digest of the promoted build:
+    #   kustomize edit set image ghcr.io/udaykishore/ttl-aware-bff=ghcr.io/udaykishore/ttl-aware-bff@sha256:...
+    newTag: "1.0.0"
+
+patches:
+  # --- Deployment -------------------------------------------------------
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: ttl-aware-bff
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ttl-aware-bff
+      spec:
+        template:
+          spec:
+            # Production runs across at least three nodes, so a replica sharing
+            # a node with another is a real availability risk rather than a
+            # scheduling inconvenience. Upgrade the base's preference to a
+            # requirement.
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: ttl-aware-bff
+                        app.kubernetes.io/instance: ttl-aware-bff
+            containers:
+              - name: bff
+                # Digest-pinned images make this immaterial, but Always removes
+                # any chance of a node serving a stale layer for a mutable tag.
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: 500m
+                    memory: 512Mi
+                  limits:
+                    memory: 2Gi
+                env:
+                  - name: BFF_OBSERVABILITY__ENVIRONMENT
+                    value: "production"
+                  - name: BFF_OBSERVABILITY__LOG__LEVEL
+                    value: "info"
+                  - name: BFF_OBSERVABILITY__LOG__FORMAT
+                    value: "json"
+                  # Head sampling at 5%: the collector's tail sampler keeps all
+                  # errors and slow traces regardless.
+                  - name: BFF_OBSERVABILITY__TRACE_SAMPLE_RATIO
+                    value: "0.05"
+                  - name: OTEL_TRACES_SAMPLER_ARG
+                    value: "0.05"
+                  - name: OTEL_RESOURCE_ATTRIBUTES
+                    value: "service.namespace=bff,deployment.environment=production"
+                  # ElastiCache primary endpoint (Terraform output
+                  # `elasticache_primary_endpoint`). TLS in transit is enforced
+                  # on the replication group.
+                  - name: BFF_CACHE__REDIS__ADDR
+                    value: "master.ttl-aware-bff-prod.abcdef.use1.cache.amazonaws.com:6379"
+                  # 2Gi limit -> ~1.6Gi soft limit.
+                  - name: GOMEMLIMIT
+                    value: "1600MiB"
+
+  # --- HPA: higher floor, wider ceiling ---------------------------------
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: ttl-aware-bff
+    patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: ttl-aware-bff
+      spec:
+        minReplicas: 6
+        maxReplicas: 60
+
+  # --- PDB: with >= 6 replicas a percentage budget is safe and drains
+  #     faster than one-at-a-time -----------------------------------------
+  - target:
+      group: policy
+      version: v1
+      kind: PodDisruptionBudget
+      name: ttl-aware-bff
+    patch: |-
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: ttl-aware-bff
+      spec:
+        maxUnavailable: 25%
+
+  # --- ServiceAccount: production IRSA role -----------------------------
+  - target:
+      version: v1
+      kind: ServiceAccount
+      name: ttl-aware-bff
+    patch: |-
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: ttl-aware-bff
+        annotations:
+          eks.amazonaws.com/role-arn: "arn:aws:iam::222222222222:role/ttl-aware-bff-irsa-prod"
+
+  # --- Ingress: public hostname, WAF attached ---------------------------
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: ttl-aware-bff
+    patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: ttl-aware-bff
+        annotations:
+          alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:222222222222:certificate/22222222-2222-2222-2222-222222222222"
+          alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:us-east-1:222222222222:regional/webacl/ttl-aware-bff-waf/22222222-2222-2222-2222-222222222222"
+          alb.ingress.kubernetes.io/shield-advanced-protection: "true"
+          alb.ingress.kubernetes.io/tags: "Project=ttl-aware-bff,Component=bff,Environment=production,ManagedBy=aws-load-balancer-controller"
+      spec:
+        rules:
+          - host: bff.example.com
+            http:
+              paths:
+                - path: /api/v1
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: ttl-aware-bff
+                      port:
+                        name: http

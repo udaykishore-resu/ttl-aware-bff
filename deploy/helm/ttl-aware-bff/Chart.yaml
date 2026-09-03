@@ -1,0 +1,60 @@
+apiVersion: v2
+name: ttl-aware-bff
+description: >-
+  TTL-aware Backend-for-Frontend that routes each request between an
+  operational (gRPC) and an execution (REST) data source based on the
+  freshness of the operational source's data.
+type: application
+
+# version  — the chart's own version. Bump on any template or default change.
+# appVersion — the default image tag. CI rewrites both on release
+#              (see .github/workflows/release.yaml).
+version: 0.1.0
+appVersion: "0.1.0"
+
+kubeVersion: ">=1.30.0-0"
+
+home: https://github.com/udaykishore/ttl-aware-bff
+sources:
+  - https://github.com/udaykishore/ttl-aware-bff
+icon: https://raw.githubusercontent.com/udaykishore/ttl-aware-bff/main/docs/icon.png
+
+keywords:
+  - bff
+  - backend-for-frontend
+  - ttl
+  - freshness
+  - caching
+  - opentelemetry
+
+maintainers:
+  - name: udaykishore
+    url: https://github.com/udaykishore
+
+annotations:
+  # Rendered by Artifact Hub on the chart page.
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/containsSecurityUpdates: "false"
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/images: |
+    - name: bff
+      image: ghcr.io/udaykishore/ttl-aware-bff:0.1.0
+    - name: opsource
+      image: ghcr.io/udaykishore/ttl-aware-bff-opsource:0.1.0
+    - name: exsource
+      image: ghcr.io/udaykishore/ttl-aware-bff-exsource:0.1.0
+
+dependencies:
+  # Bitnami Redis, used as the L2 cache. Guarded by `redis.enabled` so that a
+  # production install pointing at ElastiCache pulls nothing: with the condition
+  # false, Helm skips the subchart entirely — no PVCs, no StatefulSet, no
+  # subchart values rendered.
+  #
+  # Run `helm dependency update deploy/helm/ttl-aware-bff` before packaging;
+  # this writes Chart.lock and vendors the .tgz into charts/.
+  - name: redis
+    version: "20.6.*"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+    tags:
+      - cache

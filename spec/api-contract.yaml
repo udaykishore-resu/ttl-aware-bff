@@ -1,0 +1,2494 @@
+openapi: 3.1.0
+
+info:
+  title: TTL-Aware BFF API
+  version: 1.0.0
+  summary: TTL-aware intelligent data-source routing Backend-for-Frontend.
+  description: |
+    Read-only aggregation tier over two heterogeneous sources:
+
+      * **ODS** — Operational Data Source (gRPC, low latency, current state)
+      * **EDS** — Execution Data Source (REST, higher latency, workflow / history / audit)
+
+    Every request is classified, routed through an ordered 11-rule policy chain
+    driven by configurable TTLs, source health, required fields and consistency
+    requirements, mapped into a single canonical domain model, resolved by an
+    explicit source-precedence policy, and returned inside a stable envelope
+    carrying freshness and provenance metadata.
+
+    Normative requirements: `spec/requirements.md`.
+    Routing semantics: `spec/routing-policy.md`.
+    Error semantics: `spec/error-model.md`.
+
+    ## Response envelope
+
+    Every 2xx body is `{ "data": ..., "meta": ... }` (REQ-API-004). `meta` always
+    carries the routing decision, the stable routing rule id, the freshness
+    verdict, per-field-group provenance, and structured warnings.
+
+    ## Degradation
+
+    `meta.degraded` means the data is old or came from a fallback source — both
+    the routing-time rung (`health.primary_unavailable`) and the call-time rung
+    (`fallback.primary_failed`) set it, each with a `SOURCE_UNAVAILABLE` warning.
+    `meta.partial` means at least one source the request wanted did not answer.
+    They are orthogonal (REQ-API-007).
+
+    Any partial answer is a `206`; a degraded-but-complete answer stays `200`.
+    The status is derived from `meta.partial` alone.
+
+    Response headers carry the same facts for anyone reading an access log:
+    `X-BFF-Source`, `X-BFF-Freshness`, and `X-BFF-Degraded: true` when degraded.
+    There is no routing-rule header — the rule id is `meta.routingRule`.
+
+    ## Compatibility
+
+    Additive changes only within `/api/v1`. Clients MUST tolerate unknown `meta`
+    fields, unknown warning codes and unknown error codes; for an unknown error
+    code, fall back to the HTTP status.
+  contact:
+    name: TTL-Aware BFF maintainers
+    url: https://github.com/udaykishore/ttl-aware-bff
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: https://{host}/api/v1
+    description: Deployed BFF data plane
+    variables:
+      host:
+        default: bff.internal
+  - url: http://localhost:8080/api/v1
+    description: Local development
+
+tags:
+  - name: resources
+    description: Canonical resource reads. Routed OPERATIONAL, EXECUTION or BOTH by policy.
+  - name: executions
+    description: Workflow execution reads. Always served from the Execution Data Source.
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  /resources/{resourceId}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/TraceParent'
+      - $ref: '#/components/parameters/Consistency'
+      - $ref: '#/components/parameters/Fields'
+    get:
+      tags: [resources]
+      operationId: getResource
+      summary: Read a resource
+      description: |
+        Classification `resource_read`. Preferred source OPERATIONAL with
+        `ttl: 30s`, `cache_ttl: 5s`, `fallback: execution`, `allow_stale: true`,
+        `max_stale: 300s`.
+
+        Typical routing: `ttl.operational.fresh` → OPERATIONAL. When the
+        operational record is stale and the EDS can supply the required field
+        groups, `ttl.operational.stale` falls back to EXECUTION and the response
+        is partial (operational-only groups such as `configuration` and
+        `topology` are absent).
+      x-requirement:
+        - REQ-API-001
+        - REQ-API-004
+        - REQ-CLS-001
+        - REQ-RT-001
+        - REQ-TTL-002
+        - REQ-EDGE-001
+        - REQ-EDGE-002
+        - REQ-EDGE-003
+      x-request-type: resource_read
+      responses:
+        '200':
+          $ref: '#/components/responses/ResourceOk'
+        '206':
+          $ref: '#/components/responses/ResourcePartial'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '413': { $ref: '#/components/responses/RequestTooLarge' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '502': { $ref: '#/components/responses/UpstreamInvalid' }
+        '503': { $ref: '#/components/responses/NoSourceAvailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /resources/{resourceId}/status:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/TraceParent'
+      - $ref: '#/components/parameters/Consistency'
+      - $ref: '#/components/parameters/Fields'
+    get:
+      tags: [resources]
+      operationId: getResourceStatus
+      summary: Read a resource's status only
+      description: |
+        Classification `resource_status`. Preferred source OPERATIONAL with
+        `ttl: 10s`, `cache_ttl: 3s`, `fallback: execution`, `allow_stale: true`,
+        `max_stale: 120s`. Served by the narrow ODS RPC `GetResourceState`.
+
+        `?consistency=strong` raises the level: the cache **read** is bypassed
+        (`meta.cache.hit` is then always `false`), stale-serve is forbidden, and
+        rule `consistency.strong_requires_operational` fires, reading the
+        preferred source live with no TTL evaluation. There is no
+        `Cache-Control: no-cache` handling on the request path.
+
+        The required-field set for `resource_status` is `status` **alone**.
+        `subState` is `omitempty` decoration that no caller can depend on, and
+        listing it as required would make every answer from a source that does
+        not model it look incomplete — which, since an under-covered answer is
+        now a `206`, would turn a perfectly good execution-sourced status into a
+        partial response. Because `status` lists the execution source as a
+        supplier, a fallback answer for this endpoint stays `200`.
+
+        When the operational record declares an `in_flight_execution_ref` and
+        `routing.defaults.resolve_in_flight_execution` is on, this
+        operational-only read makes one extra execution-source call, bounded by
+        `in_flight_lookup_timeout` (300ms), so `/status` and `/details` cannot
+        report different statuses for the same resource mid-workflow. It is
+        best-effort: a failure leaves the operational answer standing. Because
+        that call contributes a source, `meta.routingDecision` reads `BOTH` and
+        `meta.sources` names both — the routing *decision* was still
+        operational-only.
+      x-requirement:
+        - REQ-API-001
+        - REQ-CLS-004
+        - REQ-RT-001
+        - REQ-TTL-003
+        - REQ-CACHE-006
+        - REQ-EDGE-001
+        - REQ-EDGE-011
+      x-request-type: resource_status
+      responses:
+        '200':
+          description: |
+            Status resolved. `data` is the narrow status projection
+            (`StatusView`) rather than a full `Resource`; the groups it omits are
+            omitted by design and do not set `partial` (REQ-EDGE-006).
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+            X-BFF-Source: { $ref: '#/components/headers/XBFFSource' }
+            X-BFF-Freshness: { $ref: '#/components/headers/XBFFFreshness' }
+            X-BFF-Degraded: { $ref: '#/components/headers/XBFFDegraded' }
+            Cache-Control: { $ref: '#/components/headers/CacheControlOut' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatusEnvelope' }
+              examples:
+                fresh:
+                  $ref: '#/components/examples/StatusFresh'
+                staleDegraded:
+                  $ref: '#/components/examples/StatusStaleDegraded'
+                cacheStale:
+                  $ref: '#/components/examples/StatusCacheStaleServed'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '502': { $ref: '#/components/responses/UpstreamInvalid' }
+        '503': { $ref: '#/components/responses/NoSourceAvailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /resources/{resourceId}/configuration:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/TraceParent'
+      - $ref: '#/components/parameters/Consistency'
+      - $ref: '#/components/parameters/Fields'
+    get:
+      tags: [resources]
+      operationId: getResourceConfiguration
+      summary: Read a resource's effective configuration
+      description: |
+        Classification `resource_configuration`. Preferred source OPERATIONAL
+        with `ttl: 30s`, `cache_ttl: 15s`, **`fallback: none`**,
+        `allow_stale: true`, `max_stale: 300s`.
+
+        `fallback: none` is structural, not a policy preference: the EDS cannot
+        supply configuration, so rule `health.primary_unavailable` cannot
+        redirect and the call-time `fallback.primary_failed` has nowhere to go
+        either. When the ODS is unavailable the degradation ladder is
+        cache → stale cache (≤ `max_stale`) → `503 NO_SOURCE_AVAILABLE`.
+
+        **The rule id this endpoint reports is a TTL rule, not
+        `fields.operational_only`.** `configuration` is exclusive to the
+        operational source, so rule 4 fires — but it *pins* the source, clears
+        the configured fallback and falls through to rules 8/9/10 rather than
+        terminating. Terminating there would skip the `max_stale` ceiling for the
+        one request type that has nowhere else to go, and that ceiling is a
+        safety property rather than an optimisation. Rule 4 emits its own id only
+        when the operational source is unavailable, and then with
+        `routingDecision: NONE`.
+
+        `data` is the narrow configuration projection (`ConfigurationView`),
+        not a full `Resource`.
+
+        Configuration keys matching configured secret patterns are redacted
+        according to the caller's permissions (REQ-SEC-011).
+      x-requirement:
+        - REQ-API-001
+        - REQ-RT-007
+        - REQ-TTL-008
+        - REQ-SEC-011
+        - REQ-EDGE-003
+      x-request-type: resource_configuration
+      responses:
+        '200':
+          description: Configuration resolved from the operational source or from cache.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+            X-BFF-Source: { $ref: '#/components/headers/XBFFSource' }
+            X-BFF-Freshness: { $ref: '#/components/headers/XBFFFreshness' }
+            X-BFF-Degraded: { $ref: '#/components/headers/XBFFDegraded' }
+            Cache-Control: { $ref: '#/components/headers/CacheControlOut' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigurationEnvelope' }
+              examples:
+                fresh: { $ref: '#/components/examples/ConfigurationFresh' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '502': { $ref: '#/components/responses/UpstreamInvalid' }
+        '503': { $ref: '#/components/responses/NoSourceAvailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /resources/{resourceId}/executions:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/IncludeAudit'
+      - $ref: '#/components/parameters/Consistency'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/TraceParent'
+    get:
+      tags: [executions]
+      operationId: listResourceExecutions
+      summary: List a resource's execution history
+      description: |
+        Classification `execution_history`. Preferred source EXECUTION with
+        `ttl: 0s` (**always live**), `cache_ttl: 0s`, `fallback: none`,
+        `allow_stale: false`.
+
+        `ttl: 0` means the freshness verdict is `STALE` by construction, so the
+        fresh branch is unreachable and no cached or stale answer is ever served
+        (REQ-TTL-010). Rule `fields.execution_only` fires because
+        `executionHistory` can only be supplied by the EDS; no operational
+        substitution is permitted, so EDS unavailability is a `503` rather than a
+        degraded answer (REQ-EDGE-004).
+
+        An existing resource with no executions returns `200` with
+        `data.items: []` and `data.total: 0` — never `404` (REQ-EDGE-019). No
+        warning is attached: an empty collection is an answer, and there is no
+        `EMPTY_RESULT` code in the canonical warning vocabulary.
+
+        Because `ttl: 0s`, `meta.freshness` reports `state: UNKNOWN` with
+        `ttlSeconds: 0`. Execution data is a record of what happened rather than
+        a cache of current state, so claiming `FRESH` would imply a guarantee the
+        source does not make.
+      x-requirement:
+        - REQ-API-001
+        - REQ-API-014
+        - REQ-RT-001
+        - REQ-TTL-010
+        - REQ-EDGE-004
+        - REQ-EDGE-019
+      x-request-type: execution_history
+      responses:
+        '200':
+          description: Execution history, newest first by `startedAt`.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+            X-BFF-Source: { $ref: '#/components/headers/XBFFSource' }
+            X-BFF-Freshness: { $ref: '#/components/headers/XBFFFreshness' }
+            X-BFF-Degraded: { $ref: '#/components/headers/XBFFDegraded' }
+            Cache-Control: { $ref: '#/components/headers/CacheControlOut' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutionListEnvelope' }
+              examples:
+                page: { $ref: '#/components/examples/ExecutionHistoryPage' }
+                empty: { $ref: '#/components/examples/ExecutionHistoryEmpty' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '502': { $ref: '#/components/responses/UpstreamInvalid' }
+        '503': { $ref: '#/components/responses/NoSourceAvailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /resources/{resourceId}/executions/{executionId}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+      - $ref: '#/components/parameters/ExecutionId'
+      - $ref: '#/components/parameters/IncludeAudit'
+      - $ref: '#/components/parameters/Consistency'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/TraceParent'
+    get:
+      tags: [executions]
+      operationId: getResourceExecution
+      summary: Read a single execution
+      description: |
+        Classification `execution_status`. Preferred source EXECUTION with
+        `ttl: 5s`, `cache_ttl: 2s`, `fallback: none`, **`allow_stale: false`**.
+
+        Stale-serve is disabled because a stale execution status is actively
+        misleading — a caller may believe a run has finished when it is still
+        applying changes. The execution must belong to the requested resource;
+        a mismatch is `404`, not a cross-resource read.
+
+        `allow_stale: false` is expressed as `consistency: strong`, and that has
+        a second consequence worth stating: a strongly-consistent request
+        **bypasses the cache read**. So despite the configured `cache_ttl: 2s`
+        this endpoint is never *answered* from cache — `meta.cache.hit` is always
+        `false` — although a successful response is still written back through
+        `Manager.Store` for callers at weaker levels (REQ-CACHE-006).
+      x-requirement:
+        - REQ-API-001
+        - REQ-CLS-004
+        - REQ-TTL-008
+        - REQ-EDGE-004
+        - REQ-EDGE-007
+        - REQ-EDGE-015
+      x-request-type: execution_status
+      responses:
+        '200':
+          description: The execution record.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+            X-BFF-Source: { $ref: '#/components/headers/XBFFSource' }
+            X-BFF-Freshness: { $ref: '#/components/headers/XBFFFreshness' }
+            X-BFF-Degraded: { $ref: '#/components/headers/XBFFDegraded' }
+            Cache-Control: { $ref: '#/components/headers/CacheControlOut' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutionEnvelope' }
+              examples:
+                running: { $ref: '#/components/examples/ExecutionRunning' }
+                failed: { $ref: '#/components/examples/ExecutionFailed' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '502': { $ref: '#/components/responses/UpstreamInvalid' }
+        '503': { $ref: '#/components/responses/NoSourceAvailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /resources/{resourceId}/details:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/TraceParent'
+      - $ref: '#/components/parameters/Consistency'
+      - $ref: '#/components/parameters/Fields'
+    get:
+      tags: [resources]
+      operationId: getResourceDetails
+      summary: Read a resource with execution context (fan-out)
+      description: |
+        Classification `resource_details`. Preferred source BOTH with `ttl: 30s`,
+        `cache_ttl: 5s`, `fallback: operational`, `allow_stale: true`,
+        `max_stale: 300s`, `required_sources: {operational: true, execution: false}`.
+
+        Rule `fields.span_both` fires because the required field set contains
+        both operational-only groups (`configuration`, `topology`) and
+        execution-only groups (`latestExecution`, `lastOperation`). The two
+        source calls run concurrently with independent deadlines; total latency
+        is the *maximum* of the two branches, never their sum (REQ-PERF-006).
+
+        The execution branch is **optional**: its failure sets `partial: true`
+        and attaches a warning, and never cancels the operational branch
+        (REQ-AGG-002). The operational branch is **required**: its failure aborts
+        the fan-out and sends the request down the degradation ladder.
+
+        A partial answer is always `206`, whichever side is missing —
+        `response.Writer.OK` derives the status from `meta.partial` alone, so
+        there is no `200 partial: true` case. A degraded-but-complete answer
+        stays `200` with `meta.degraded: true`, because the data is whole and
+        only older than intended (REQ-ERR-009).
+
+        `data` embeds the resource's own fields at the top level alongside
+        `latestExecution` and `executionHistory`; there is no `data.resource`
+        wrapper.
+
+        When the latest execution is in progress, the `status` and `subState`
+        fields are taken from the EXECUTION source regardless of base precedence
+        (REQ-PREC-003), and `meta.provenance` reflects that.
+      x-requirement:
+        - REQ-API-001
+        - REQ-API-006
+        - REQ-API-007
+        - REQ-AGG-001
+        - REQ-AGG-004
+        - REQ-PREC-001
+        - REQ-PREC-003
+        - REQ-EDGE-008
+        - REQ-EDGE-015
+        - REQ-EDGE-018
+      x-request-type: resource_details
+      responses:
+        '200':
+          description: |
+            Details assembled from both sources. `degraded: true` when the data
+            is stale or came from a fallback source. A missing source makes the
+            response `206`, never a `200` with `partial: true`.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+            X-BFF-Source: { $ref: '#/components/headers/XBFFSource' }
+            X-BFF-Freshness: { $ref: '#/components/headers/XBFFFreshness' }
+            X-BFF-Degraded: { $ref: '#/components/headers/XBFFDegraded' }
+            Cache-Control: { $ref: '#/components/headers/CacheControlOut' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResourceDetailsEnvelope' }
+              examples:
+                complete: { $ref: '#/components/examples/DetailsComplete' }
+                partialExecutionTimeout: { $ref: '#/components/examples/DetailsPartial' }
+                runningOverride: { $ref: '#/components/examples/DetailsRunningOverride' }
+        '206':
+          description: |
+            At least one source the request wanted did not answer — normally the
+            optional execution branch. Present fields are returned; absent ones
+            are omitted, never null-filled.
+          headers:
+            X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+            X-BFF-Source: { $ref: '#/components/headers/XBFFSource' }
+            X-BFF-Freshness: { $ref: '#/components/headers/XBFFFreshness' }
+            X-BFF-Degraded: { $ref: '#/components/headers/XBFFDegraded' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResourceDetailsEnvelope' }
+              examples:
+                executionUnavailable: { $ref: '#/components/examples/DetailsExecutionUnavailable' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '502': { $ref: '#/components/responses/UpstreamInvalid' }
+        '503': { $ref: '#/components/responses/NoSourceAvailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Required on every `/api/v1/*` route (REQ-SEC-001).
+
+        Validation (REQ-SEC-002): signature against the JWKS at
+        `security.jwt.jwks_url` (or HS256 from `security.jwt.hs256_secret_env`
+        in development only), `iss`, `aud`, `exp`, `nbf`, `iat`, with
+        `security.jwt.leeway` (default 30s) applied symmetrically. `alg` is
+        allow-listed; `none` and algorithm-confusion attempts are rejected. All
+        `security.jwt.required_claims` must be present.
+
+        The tenant is resolved from the token claim (`tenant_id` by default) and
+        is authoritative. When `X-Tenant-ID` is also supplied it must match the
+        claim, otherwise `403 TENANT_MISMATCH` (REQ-SEC-004).
+
+        Authorization is by role → permission mapping per endpoint
+        (REQ-SEC-005); see `spec/security.md`.
+
+  parameters:
+
+    ResourceId:
+      name: resourceId
+      in: path
+      required: true
+      description: |
+        Tenant-scoped resource identifier, the join key between ODS and EDS.
+        Validated before anything else touches it: letters, digits and
+        `- _ . :` only, at most 128 characters. Anything else is `400`, refused
+        before a data source is contacted.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        minLength: 1
+        maxLength: 128
+      example: res-1042
+
+    ExecutionId:
+      name: executionId
+      in: path
+      required: true
+      description: Execution identifier. Must belong to `resourceId`, else `404`.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        minLength: 1
+        maxLength: 128
+      example: exec-8f21c4
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        Maximum executions to return.
+
+        A non-integer or a value below 1 is rejected with
+        `400 INVALID_REQUEST` (REQ-API-014). A value **above** the configured
+        ceiling is clamped down to `sources.execution.max_history_items` (200)
+        rather than rejected, because the ceiling is a protection for the source
+        rather than a contract with the caller. Omitting it uses
+        `sources.execution.history_page_size` (25).
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        default: 25
+      example: 25
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque pagination cursor returned as `data.nextCursor`. Base64url, at most 512 bytes.
+      schema:
+        type: string
+        maxLength: 512
+        pattern: '^[A-Za-z0-9_-]+={0,2}$'
+      example: eyJvIjoxMDB9
+
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: |
+        Client-supplied correlation id, echoed in the response header and in
+        `meta.correlationId`. Generated as a UUIDv4 when absent or malformed
+        (REQ-API-010). Propagated to both sources.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9._-]{1,128}$'
+      example: 2f9c1a7e-3b64-4c2a-9d15-7a0f4b8e1c33
+
+    TenantIdHeader:
+      name: X-Tenant-ID
+      in: header
+      required: false
+      description: |
+        Optional tenant assertion. When present it MUST equal the JWT tenant
+        claim, otherwise `403 TENANT_MISMATCH` (REQ-SEC-004).
+
+        In a `local` or `test` environment running with
+        `security.allow_insecure_no_auth: true`, which configuration validation
+        permits nowhere else, this header *is* the tenant and no token is needed;
+        it defaults to `local` when absent. That is how the compose stack is
+        driven.
+      schema:
+        type: string
+        pattern: '^[a-z0-9][a-z0-9-]{0,63}$'
+      example: acme
+
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: Caller-side request identifier, logged but not interpreted.
+      schema:
+        type: string
+        maxLength: 128
+
+    TraceParent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context parent. Honoured as the parent span and propagated to both sources (REQ-API-011).
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+      example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+    Consistency:
+      name: consistency
+      in: query
+      required: false
+      description: |
+        Caller consistency override, honoured **only when it is stricter** than
+        the level the endpoint is configured with: a caller may ask for more
+        consistency than the endpoint promises, never for less (REQ-CLS-005).
+
+        `strong` forbids stale-serve outright and makes rule
+        `consistency.strong_requires_operational` fire, which reads the preferred
+        source live with no TTL evaluation at all. It also disables the call-time
+        fallback: the caller asked for one specific source's live answer and must
+        not silently receive another's.
+
+        It additionally **bypasses the cache read**. `Service.load` calls the
+        loader directly rather than going through `GetOrLoad`, so `meta.cache.hit`
+        is always `false`; the result is still written back via `Manager.Store`,
+        because callers at weaker levels can legitimately use it (REQ-CACHE-006).
+
+        There is no `Cache-Control: no-cache` handling on the request path; this
+        query parameter is the only way to raise consistency.
+      schema:
+        type: string
+        enum: [eventual, bounded, strong]
+      example: strong
+
+    Fields:
+      name: fields
+      in: query
+      required: false
+      description: |
+        Comma-separated projection over the canonical field names in
+        `FieldGroup`. It is a *routing* input as well as a response filter: the
+        field catalogue is what lets the router prove a request needs only one
+        source. At most 32 fields; an unknown name is `400 INVALID_REQUEST`.
+      schema:
+        type: string
+      example: status
+
+    IncludeAudit:
+      name: includeAudit
+      in: query
+      required: false
+      description: |
+        Include audit records on execution reads. Requires the
+        `execution.audit.read` permission: asking for audit data the caller may
+        not see is `403`, not a silently narrowed response.
+      schema:
+        type: boolean
+      example: false
+
+  headers:
+
+    XCorrelationID:
+      description: Echo of the request correlation id, or the generated one (REQ-API-010).
+      schema: { type: string }
+
+    XBFFSource:
+      description: |
+        The routing target that answered, mirroring `meta.routingDecision`.
+        Set on every 2xx by `response.Writer.OK`.
+      schema:
+        type: string
+        enum: [OPERATIONAL, EXECUTION, BOTH, NONE]
+
+    XBFFFreshness:
+      description: Freshness verdict for the served data, mirroring `meta.freshness.state`.
+      schema:
+        type: string
+        enum: [FRESH, STALE, UNKNOWN]
+
+    XBFFDegraded:
+      description: |
+        Emitted as `true` only when `meta.degraded` is set, so an operator
+        reading an access log can spot a degraded answer without a body parser.
+        Absent otherwise. There is deliberately no routing-**rule** header: the
+        rule id is a response-body field (`meta.routingRule`), not a header.
+      schema:
+        type: string
+        enum: ['true']
+
+    CacheControlOut:
+      description: Always `no-store` for authenticated responses (REQ-SEC-014).
+      schema: { type: string }
+
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+
+    Allow:
+      description: Methods permitted on this path.
+      schema: { type: string }
+
+  schemas:
+
+    # ---------------------------------------------------------------- enums
+
+    SourceKind:
+      type: string
+      description: Origin of a value (contract §4).
+      enum: [OPERATIONAL, EXECUTION, CACHE, NONE]
+
+    RoutingDecision:
+      type: string
+      enum: [OPERATIONAL, EXECUTION, BOTH, NONE]
+
+    RoutingRule:
+      type: string
+      description: |
+        Stable rule id, also emitted as a metric and span attribute. The first
+        eleven are the pre-flight chain in `internal/router`, evaluated in this
+        order, first match wins. The last two are **not** part of the chain: the
+        application layer stamps them after routing has already produced a
+        decision.
+
+        `fields.operational_only` appears only when the operational source is
+        unavailable, and then with `routingDecision: NONE`. On the healthy path
+        that rule pins the source and falls through, so an operational-only
+        endpoint such as `/configuration` reports a `ttl.*` rule instead.
+
+        `guard.unconfigured_request_type` is a **pre-chain** exit, not one of the
+        eleven: it is taken when the request type has no routing rule configured
+        at all, which is a deployment defect rather than a routing outcome. It is
+        emitted to `routing_decision_total` like any other decision so that a
+        configuration which has lost a request type is visible in the metric an
+        operator reads first.
+      enum:
+        - guard.unconfigured_request_type
+        - guard.tenant_missing
+        - health.both_unavailable
+        - fields.execution_only
+        - fields.operational_only
+        - fields.span_both
+        - consistency.strong_requires_operational
+        - health.primary_unavailable
+        - ttl.operational.fresh
+        - ttl.operational.stale
+        - ttl.unknown_freshness
+        - default.preferred_source
+        - fallback.primary_failed
+        - degrade.stale_cache
+
+    FreshnessState:
+      type: string
+      enum: [FRESH, STALE, UNKNOWN]
+
+    ResourceStatus:
+      type: string
+      description: Canonical lifecycle status. Mapped from ODS `ResourceState` (see `spec/data-contracts.md` §6.1).
+      enum: [PENDING, ACTIVE, SUSPENDED, DEGRADED, TERMINATING, TERMINATED, ERROR, UNKNOWN]
+
+    ExecutionStatus:
+      type: string
+      description: Canonical execution status. Mapped from EDS `status` strings (see `spec/data-contracts.md` §6.2).
+      enum: [QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED, TIMED_OUT, UNKNOWN]
+
+    CacheLayer:
+      type: string
+      enum: [L1, L2, NONE]
+
+    FieldGroup:
+      type: string
+      description: |
+        Canonical field name, the unit of precedence and provenance. The set is
+        exactly the key set of `precedence.fields` in `configs/bff.yaml`; the
+        field catalogue is derived from it, so a field with no configured
+        precedence has no supplier and is rejected at config-validation time.
+      enum:
+        - status
+        - subState
+        - type
+        - configuration
+        - metrics
+        - topology
+        - owner
+        - labels
+        - customerId
+        - latestExecution
+        - executionHistory
+        - executionStatus
+        - workflowSteps
+        - audit
+        - lastOperation
+
+    WarningCode:
+      type: string
+      description: |
+        Structured warning code (REQ-API-015). Clients MUST tolerate unknown
+        values. The set is `internal/domain`'s well-known warning codes.
+      enum:
+        - STALE_DATA
+        - SOURCE_TIMEOUT
+        - SOURCE_UNAVAILABLE
+        - PARTIAL_DATA
+        - CONFLICT_RESOLVED
+        - SCHEMA_VERSION_MISMATCH
+        - CLOCK_SKEW_DETECTED
+        - CACHE_UNAVAILABLE
+
+    ErrorCode:
+      type: string
+      description: |
+        Closed set of BFF error codes (REQ-API-009). Clients MUST fall back to
+        the HTTP status for an unrecognised code.
+      enum:
+        - INVALID_REQUEST
+        - UNAUTHENTICATED
+        - FORBIDDEN
+        - TENANT_MISMATCH
+        - NOT_FOUND
+        - RATE_LIMITED
+        - REQUEST_TOO_LARGE
+        - UPSTREAM_TIMEOUT
+        - UPSTREAM_UNAVAILABLE
+        - UPSTREAM_INVALID_RESPONSE
+        - SCHEMA_VERSION_MISMATCH
+        - NO_SOURCE_AVAILABLE
+        - INTERNAL
+
+    SourceState:
+      type: string
+      description: |
+        Per-source state reported alongside an error, rendered by
+        `resilience.Executor.HealthDetail`. It names the source's *role* state,
+        never its address.
+      enum: [HEALTHY, CIRCUIT_OPEN, CIRCUIT_HALF_OPEN, SATURATED, UNCONFIGURED]
+
+    # ---------------------------------------------------------------- meta
+
+    Freshness:
+      type: object
+      description: |
+        Freshness verdict for the served data (REQ-API-005).
+
+        Only the operational source publishes a freshness envelope, so this
+        always describes the operational observation. An answer that came from
+        the execution source reports `state: UNKNOWN` with `source: EXECUTION`
+        rather than borrowing the operational verdict, because the EDS makes no
+        freshness guarantee and claiming one would be a fabrication.
+
+        `ageSeconds` and `ttlSeconds` are produced by a custom `MarshalJSON` on
+        `domain.Freshness`: the underlying `Age` and `TTL` are `time.Duration`
+        and would otherwise serialise as opaque nanosecond integers. The same
+        `UnmarshalJSON` restores them, so a cache entry written by one replica
+        reports the same age when another serves it.
+      required: [state, ageSeconds, ttlSeconds]
+      properties:
+        state:
+          $ref: '#/components/schemas/FreshnessState'
+        ageSeconds:
+          type: number
+          format: double
+          minimum: 0
+          description: |
+            Skew-corrected age of the source observation, in seconds. **Always
+            present** — there is no `omitempty`. When `state` is `UNKNOWN` it is
+            `0`, and `state` is what tells the client the number means nothing:
+            do not read `ageSeconds: 0` as "brand new" without checking `state`.
+        ttlSeconds:
+          type: number
+          format: double
+          minimum: 0
+          description: |
+            Effective freshness TTL applied, after any tenant override
+            (REQ-TTL-003). Always present. `0` for a request type configured
+            `ttl: 0s`, which never accepts age-based satisfaction.
+        observedAt:
+          type: string
+          format: date-time
+          description: Source-reported last refresh of the record. Omitted when unknown.
+        evaluatedAt:
+          type: string
+          format: date-time
+          description: When the BFF made the freshness judgement. Omitted when unset.
+        source:
+          $ref: '#/components/schemas/SourceKind'
+        skewCorrected:
+          type: boolean
+          description: |
+            The source's clock disagreed with the BFF's beyond
+            `routing.defaults.clock_skew_tolerance` and the age was corrected.
+            Omitted when false; accompanied by a `CLOCK_SKEW_DETECTED` warning.
+        version:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The source's monotonic record version, when it publishes one. Omitted when zero.
+      examples:
+        - { state: FRESH, ageSeconds: 6.3, ttlSeconds: 10, observedAt: '2026-09-03T12:00:03.100Z', evaluatedAt: '2026-09-03T12:00:09.400Z', source: OPERATIONAL, version: 7 }
+        - { state: UNKNOWN, ageSeconds: 0, ttlSeconds: 30, source: EXECUTION }
+
+    CacheMeta:
+      type: object
+      description: |
+        Reported separately from `freshness` because a cache TTL and a source
+        freshness TTL are different concepts; conflating them is the bug this
+        design exists to avoid (REQ-CACHE-001).
+
+        `hit` is always `false` for a strongly-consistent request: those bypass
+        the cache **read** entirely and are only ever written back
+        (REQ-CACHE-006).
+      required: [hit, layer]
+      properties:
+        hit:
+          type: boolean
+        layer:
+          $ref: '#/components/schemas/CacheLayer'
+        ageMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            How long the entry had been resident when it was served. Present on
+            a hit; omitted when zero.
+
+    Provenance:
+      type: object
+      description: |
+        Per-field-group origin of the values in `data` (REQ-API-006). Groups
+        absent from `data` are absent here.
+      additionalProperties:
+        $ref: '#/components/schemas/SourceKind'
+      propertyNames:
+        $ref: '#/components/schemas/FieldGroup'
+      examples:
+        - { status: OPERATIONAL, configuration: OPERATIONAL, latestExecution: EXECUTION }
+
+    Warning:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/WarningCode'
+        message:
+          type: string
+          description: Human-facing text. Never contains tenant-identifying data (REQ-API-015).
+          maxLength: 512
+        source:
+          description: |
+            The source the warning is *about*. For `SOURCE_UNAVAILABLE` and
+            `SOURCE_TIMEOUT` that is the source which **failed**, never the one
+            that answered: this is the single field an operator reads to find out
+            which side broke, and naming the survivor would invert its meaning.
+          $ref: '#/components/schemas/SourceKind'
+
+    ResponseMeta:
+      type: object
+      description: Envelope metadata present on every 2xx response (REQ-API-004).
+      required:
+        - correlationId
+        - routingDecision
+        - routingRule
+        - sources
+        - freshness
+        - degraded
+        - partial
+        - cache
+      properties:
+        correlationId:
+          type: string
+        routingDecision:
+          $ref: '#/components/schemas/RoutingDecision'
+        routingRule:
+          $ref: '#/components/schemas/RoutingRule'
+        sources:
+          type: array
+          description: Sources that actually contributed data to this response.
+          items: { $ref: '#/components/schemas/SourceKind' }
+        freshness:
+          $ref: '#/components/schemas/Freshness'
+        degraded:
+          type: boolean
+          description: |
+            Data is stale, or came from a fallback source rather than the one the
+            request type prefers (REQ-API-007). **Both** fallback rungs set it:
+            the routing-time `health.primary_unavailable` and the call-time
+            `fallback.primary_failed`, each with a `SOURCE_UNAVAILABLE` warning.
+            Also mirrored as the `X-BFF-Degraded: true` response header.
+        partial:
+          type: boolean
+          description: |
+            The body does not carry everything the request asked for
+            (REQ-API-007). Two independent conditions set it:
+
+              * a source the request wanted did not answer, or
+              * the source that *did* answer cannot hold every requested field —
+                which is what a fallback to the execution source means for an
+                endpoint like `/resources/{resourceId}`.
+
+            A field counts as unsatisfiable only when **none** of its catalogued
+            suppliers is in the chosen target, so a fallback answer whose fields
+            the fallback source can legitimately provide (`/status`, where the
+            EDS is a supplier of `status`) stays complete.
+
+            A partial response is always HTTP `206`: `response.Writer.OK` derives
+            the status from this flag alone.
+        cache:
+          $ref: '#/components/schemas/CacheMeta'
+        provenance:
+          $ref: '#/components/schemas/Provenance'
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/Warning' }
+        elapsedMs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Server-side wall time for the request. Omitted when zero.
+
+    # ---------------------------------------------------------------- domain
+    #
+    # Every property name below is a JSON struct tag in internal/domain. Field
+    # groups a request did not ask for, or that no source supplied, are OMITTED
+    # rather than null-filled (REQ-EDGE-006).
+
+    Owner:
+      type: object
+      description: Absent entirely when the source supplied no ownership record (REQ-PREC-005).
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          description: '`team` | `user` | `service`; unrecognised values pass through.'
+        email:
+          type: string
+          format: email
+          description: Redacted or omitted based on caller permissions (REQ-SEC-011).
+        costCentre: { type: string }
+
+    Metric:
+      type: object
+      required: [name, value]
+      properties:
+        name: { type: string }
+        value:
+          type: number
+          format: double
+          description: Never `NaN` or `Infinity`; such a source value is rejected as `UPSTREAM_INVALID_RESPONSE`.
+        unit:
+          type: string
+          description: Carried verbatim from the source. The BFF performs no unit conversion (REQ-MAP-009).
+        sampledAt:
+          type: string
+          format: date-time
+
+    Topology:
+      type: object
+      description: Absent entirely when the source supplied no topology record.
+      properties:
+        region: { type: string }
+        zone: { type: string }
+        cluster: { type: string }
+        upstream:
+          type: array
+          items: { type: string }
+        downstream:
+          type: array
+          items: { type: string }
+
+    Resource:
+      type: object
+      description: |
+        Canonical resource, the payload of `GET /resources/{resourceId}` and the
+        base of `ResourceDetails`. Field groups the request did not require, or
+        that no source supplied, are **omitted** — never null-filled
+        (REQ-EDGE-006).
+
+        The source's `schemaVersion` is deliberately not on the wire: it is a
+        transport concern the BFF resolves, not something a client acts on.
+      required: [tenantId, resourceId, status]
+      properties:
+        tenantId: { type: string }
+        resourceId: { type: string }
+        customerId: { type: string }
+        type:
+          type: string
+          description: Mapped from ODS `resource_type`.
+        status: { $ref: '#/components/schemas/ResourceStatus' }
+        subState:
+          type: string
+          description: Mapped from ODS `substate`.
+        owner: { $ref: '#/components/schemas/Owner' }
+        configuration:
+          type: object
+          additionalProperties: { type: string }
+        metrics:
+          type: array
+          items: { $ref: '#/components/schemas/Metric' }
+        topology: { $ref: '#/components/schemas/Topology' }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+        inFlightExecutionId:
+          type: string
+          description: |
+            Set when the owning source knows a workflow is currently mutating
+            this resource, mapped from the ODS `in_flight_execution_ref`. It is
+            what makes `routing.defaults.resolve_in_flight_execution` fetch the
+            named execution on an operational-only read (REQ-PREC-003).
+
+            It is a *weak* reference and confers **no** precedence authority on
+            its own. The execution-overrides-operational rule fires only when
+            there is an execution candidate the execution source still reports as
+            in progress; a marker left behind by a workflow that has since
+            finished is reported here but changes nothing, so a completed run's
+            predicted status can never outrank the operational source's observed
+            one.
+        observedAt:
+          type: string
+          format: date-time
+          description: Source-reported last refresh of this record.
+
+    StatusView:
+      type: object
+      description: |
+        The narrow payload of `GET /resources/{resourceId}/status`. It is a
+        projection of the same merged view every other endpoint is built from,
+        which is why `/status` and `/details` cannot disagree about a resource's
+        status.
+      required: [tenantId, resourceId, status]
+      properties:
+        tenantId: { type: string }
+        resourceId: { type: string }
+        status: { $ref: '#/components/schemas/ResourceStatus' }
+        subState: { type: string }
+        inFlightExecutionId: { type: string }
+        observedAt: { type: string, format: date-time }
+
+    ConfigurationView:
+      type: object
+      description: The narrow payload of `GET /resources/{resourceId}/configuration`.
+      required: [tenantId, resourceId]
+      properties:
+        tenantId: { type: string }
+        resourceId: { type: string }
+        configuration:
+          type: object
+          additionalProperties: { type: string }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        observedAt: { type: string, format: date-time }
+
+    WorkflowStep:
+      type: object
+      required: [id, sequence, status]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        sequence: { type: integer, format: int32 }
+        status: { $ref: '#/components/schemas/ExecutionStatus' }
+        startedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time }
+        attempt:
+          type: integer
+          format: int32
+          minimum: 1
+        error: { $ref: '#/components/schemas/ExecutionError' }
+
+    Action:
+      type: object
+      description: A discrete side effect performed during an execution.
+      required: [id, type]
+      properties:
+        id: { type: string }
+        type: { type: string }
+        target: { type: string }
+        outcome: { type: string }
+        performedAt: { type: string, format: date-time }
+        performedBy: { type: string }
+
+    ExecutionResult:
+      type: object
+      description: Present only for terminal executions. Absent on a `RUNNING` execution, which is normal (REQ-EDGE-007).
+      required: [outcome]
+      properties:
+        outcome: { type: string }
+        summary: { type: string }
+        values:
+          type: object
+          additionalProperties: { type: string }
+
+    ExecutionError:
+      type: object
+      description: A structured failure record, on the execution or on one of its steps.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Source vocabulary, not a BFF error code.
+        message: { type: string }
+        retryable:
+          type: boolean
+          description: Advisory from the source; does not drive BFF retry policy (REQ-RES-003).
+        step: { type: string }
+
+    AuditEntry:
+      type: object
+      description: |
+        Returned only when `?includeAudit=true` **and** the caller holds
+        `execution.audit.read`; asking for audit data without the permission is
+        a `403`, not a silently narrowed response.
+      required: [at, actor, action]
+      properties:
+        at: { type: string, format: date-time }
+        actor: { type: string }
+        action: { type: string }
+        details: { type: string }
+
+    Execution:
+      type: object
+      required: [executionId, tenantId, resourceId, operation, status]
+      properties:
+        executionId: { type: string }
+        tenantId: { type: string }
+        resourceId: { type: string }
+        customerId: { type: string }
+        operation:
+          type: string
+          description: Mapped from the EDS operation vocabulary.
+        status: { $ref: '#/components/schemas/ExecutionStatus' }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/WorkflowStep' }
+        actions:
+          type: array
+          items: { $ref: '#/components/schemas/Action' }
+        result: { $ref: '#/components/schemas/ExecutionResult' }
+        error: { $ref: '#/components/schemas/ExecutionError' }
+        audit:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEntry' }
+        startedAt: { type: string, format: date-time }
+        completedAt:
+          type: string
+          format: date-time
+          description: Absent while the execution is non-terminal.
+        updatedAt: { type: string, format: date-time }
+
+    ExecutionList:
+      type: object
+      required: [resourceId, items, total]
+      properties:
+        resourceId: { type: string }
+        items:
+          type: array
+          description: Newest first, ordered by the most specific timestamp available (REQ-API-012).
+          items: { $ref: '#/components/schemas/Execution' }
+        total:
+          type: integer
+          format: int32
+          minimum: 0
+        nextCursor:
+          type: string
+          description: Present when more results exist.
+
+    ResourceDetails:
+      type: object
+      description: |
+        The both-source view. `Resource` is **embedded**, not nested under a
+        `resource` key: the canonical type embeds `domain.Resource`, so its
+        fields appear at the top level alongside `latestExecution` and
+        `executionHistory`.
+      allOf:
+        - $ref: '#/components/schemas/Resource'
+        - type: object
+          properties:
+            latestExecution: { $ref: '#/components/schemas/Execution' }
+            executionHistory:
+              type: array
+              items: { $ref: '#/components/schemas/Execution' }
+
+    # ---------------------------------------------------------------- envelopes
+
+    ResourceEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/Resource' }
+        meta: { $ref: '#/components/schemas/ResponseMeta' }
+
+    StatusEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/StatusView' }
+        meta: { $ref: '#/components/schemas/ResponseMeta' }
+
+    ConfigurationEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/ConfigurationView' }
+        meta: { $ref: '#/components/schemas/ResponseMeta' }
+
+    ExecutionEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/Execution' }
+        meta: { $ref: '#/components/schemas/ResponseMeta' }
+
+    ExecutionListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/ExecutionList' }
+        meta: { $ref: '#/components/schemas/ResponseMeta' }
+
+    ResourceDetailsEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { $ref: '#/components/schemas/ResourceDetails' }
+        meta: { $ref: '#/components/schemas/ResponseMeta' }
+
+    # ---------------------------------------------------------------- errors
+
+    SourceErrorState:
+      type: object
+      description: |
+        One source's condition at the time of the failure. It names the source's
+        *role* and state only — never its address (REQ-SEC-009).
+      required: [source, state]
+      properties:
+        source: { $ref: '#/components/schemas/SourceKind' }
+        state: { $ref: '#/components/schemas/SourceState' }
+
+    ErrorBody:
+      type: object
+      description: |
+        RFC 7807-shaped error (REQ-API-009). `detail` never contains stack traces,
+        upstream hostnames, raw upstream payloads or token contents
+        (REQ-SEC-013); internal detail is in the logs keyed by `correlationId`.
+      required: [code, type, title, status, correlationId, retryable]
+      properties:
+        code: { $ref: '#/components/schemas/ErrorCode' }
+        type:
+          type: string
+          format: uri
+          description: '`https://errors.bff.internal/<kebab-code>`.'
+        title: { type: string }
+        status: { type: integer, format: int32, minimum: 400, maximum: 599 }
+        detail: { type: string, maxLength: 1024 }
+        correlationId: { type: string }
+        retryable:
+          type: boolean
+          description: Whether the client may safely retry, subject to `Retry-After` when present.
+        sources:
+          type: array
+          description: Per-source state at the time of failure.
+          items: { $ref: '#/components/schemas/SourceErrorState' }
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error: { $ref: '#/components/schemas/ErrorBody' }
+
+  responses:
+
+    ResourceOk:
+      description: |
+        Resource resolved, complete. `meta.degraded` indicates the data is stale
+        or came from a fallback source; a *complete* degraded answer is still a
+        `200`. An answer that is missing fields is a `206` instead.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+        X-BFF-Source: { $ref: '#/components/headers/XBFFSource' }
+        X-BFF-Freshness: { $ref: '#/components/headers/XBFFFreshness' }
+        X-BFF-Degraded: { $ref: '#/components/headers/XBFFDegraded' }
+        Cache-Control: { $ref: '#/components/headers/CacheControlOut' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ResourceEnvelope' }
+          examples:
+            fresh: { $ref: '#/components/examples/ResourceFresh' }
+            staleDegraded: { $ref: '#/components/examples/ResourceStaleDegraded' }
+
+    InvalidRequest:
+      description: Malformed path parameter, out-of-range `limit`, malformed cursor, or missing tenant.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            badLimit: { $ref: '#/components/examples/ErrInvalidRequest' }
+            tenantMissing: { $ref: '#/components/examples/ErrTenantMissing' }
+
+    Unauthenticated:
+      description: Missing, malformed or invalid bearer token (REQ-SEC-002).
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            expired: { $ref: '#/components/examples/ErrUnauthenticated' }
+
+    Forbidden:
+      description: Authenticated but not permitted, or tenant assertion mismatch (REQ-SEC-004, REQ-SEC-005).
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            forbidden: { $ref: '#/components/examples/ErrForbidden' }
+            tenantMismatch: { $ref: '#/components/examples/ErrTenantMismatch' }
+
+    ResourcePartial:
+      description: |
+        The body does not carry everything the request asked for. For
+        `resource_read` this is the **fallback** case: the operational source was
+        unavailable — pre-flight (`health.primary_unavailable`) or at call time
+        (`fallback.primary_failed`) — and the execution source answered instead.
+        The EDS holds no `configuration`, `owner`, `metrics` or `topology`, so
+        those fields are absent and `meta.partial` is `true`.
+
+        Absent fields are omitted, never null-filled, and a `PARTIAL_DATA`
+        warning says so explicitly.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+        X-BFF-Source: { $ref: '#/components/headers/XBFFSource' }
+        X-BFF-Freshness: { $ref: '#/components/headers/XBFFFreshness' }
+        X-BFF-Degraded: { $ref: '#/components/headers/XBFFDegraded' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ResourceEnvelope' }
+          examples:
+            preflightFallback: { $ref: '#/components/examples/ResourcePreflightFallback' }
+            ttlMissToExecution: { $ref: '#/components/examples/ResourceFallbackExecution' }
+
+    NotFound:
+      description: |
+        Every consulted source reports the resource absent (REQ-EDGE-019a).
+        Negatively cached for `cache.negative_ttl`. An existing resource with an
+        empty collection is `200`, not `404`.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            notFound: { $ref: '#/components/examples/ErrNotFound' }
+
+    MethodNotAllowed:
+      description: The path exists but the method is not GET (REQ-API-001).
+      headers:
+        Allow: { $ref: '#/components/headers/Allow' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+    RequestTooLarge:
+      description: Request exceeded `server.max_body_bytes` or header limits (REQ-SEC-010).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+    RateLimited:
+      description: Token bucket exhausted for this tenant or globally (REQ-RES-008).
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            rateLimited: { $ref: '#/components/examples/ErrRateLimited' }
+
+    Internal:
+      description: Unexpected internal failure. Recovered panics land here (REQ-RES-012).
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+    UpstreamInvalid:
+      description: |
+        A source returned an undecodable or semantically invalid payload, or a
+        major schema-version mismatch (REQ-EDGE-017, REQ-EDGE-020). Terminal —
+        not retryable.
+      headers:
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            invalidPayload: { $ref: '#/components/examples/ErrUpstreamInvalid' }
+            schemaMismatch: { $ref: '#/components/examples/ErrSchemaMismatch' }
+
+    NoSourceAvailable:
+      description: |
+        No source could produce data and the degradation ladder was exhausted
+        (REQ-EDGE-005, REQ-RES-009). Retryable.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            bothDown: { $ref: '#/components/examples/ErrNoSourceAvailable' }
+            upstreamUnavailable: { $ref: '#/components/examples/ErrUpstreamUnavailable' }
+
+    UpstreamTimeout:
+      description: A required source exceeded its per-source deadline (REQ-EDGE-013). Retryable.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        X-Correlation-ID: { $ref: '#/components/headers/XCorrelationID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            timeout: { $ref: '#/components/examples/ErrUpstreamTimeout' }
+
+  examples:
+
+    # Every `meta` below is a real envelope shape: `meta.freshness` always
+    # carries `ageSeconds` and `ttlSeconds`, `meta.cache` carries `ageMs` on a
+    # hit, and the warning codes and messages are the ones internal/domain and
+    # internal/application actually emit.
+
+    # -------------------------------------------------------------- fresh
+
+    ResourceFresh:
+      summary: Fresh operational read (REQ-EDGE-001)
+      description: |
+        Probe reported `age = 8.2s` against `ttl = 30s`. Rule
+        `ttl.operational.fresh` fired, the EDS was never called, and
+        `operational_ttl_hit_total` was incremented.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          customerId: cust-77
+          type: compute.instance
+          status: ACTIVE
+          subState: steady
+          owner:
+            id: team-platform
+            type: team
+            email: platform@example.com
+            costCentre: CC-04
+          configuration:
+            autoscale: "true"
+            maxReplicas: "12"
+            region: eu-west-1
+          metrics:
+            - { name: cpu_utilisation, value: 41.7, unit: percent, sampledAt: '2026-09-03T12:00:02.000Z' }
+          topology:
+            region: eu-west-1
+            zone: eu-west-1b
+            cluster: prod-3
+            upstream: [res-0001]
+            downstream: [res-2201, res-2202]
+          labels:
+            env: prod
+          observedAt: '2026-09-03T12:00:03.100Z'
+        meta:
+          correlationId: 2f9c1a7e-3b64-4c2a-9d15-7a0f4b8e1c33
+          routingDecision: OPERATIONAL
+          routingRule: ttl.operational.fresh
+          sources: [OPERATIONAL]
+          freshness:
+            state: FRESH
+            ageSeconds: 8.2
+            ttlSeconds: 30
+            observedAt: '2026-09-03T12:00:03.100Z'
+            evaluatedAt: '2026-09-03T12:00:11.300Z'
+            source: OPERATIONAL
+            version: 41
+          degraded: false
+          partial: false
+          cache: { hit: false, layer: NONE }
+          provenance:
+            status: OPERATIONAL
+            subState: OPERATIONAL
+            configuration: OPERATIONAL
+            metrics: OPERATIONAL
+            topology: OPERATIONAL
+            owner: OPERATIONAL
+            labels: OPERATIONAL
+            customerId: OPERATIONAL
+          warnings: []
+          elapsedMs: 6
+
+    StatusFresh:
+      summary: Fresh status read via the narrow ODS RPC
+      description: |
+        `/status` is served by `GetResourceState`, not by the full `GetResource`:
+        the tightest endpoint should not pay for configuration, metrics and
+        topology it is about to discard. `data` is the narrow status projection.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          status: ACTIVE
+          subState: steady
+          observedAt: '2026-09-03T12:00:03.100Z'
+        meta:
+          correlationId: 6b1d0f22-91a3-4a7e-8c40-1de55a7c0b90
+          routingDecision: OPERATIONAL
+          routingRule: ttl.operational.fresh
+          sources: [OPERATIONAL]
+          freshness:
+            state: FRESH
+            ageSeconds: 6.3
+            ttlSeconds: 10
+            observedAt: '2026-09-03T12:00:03.100Z'
+            evaluatedAt: '2026-09-03T12:00:09.400Z'
+            source: OPERATIONAL
+            version: 41
+          degraded: false
+          partial: false
+          cache: { hit: false, layer: NONE }
+          provenance: { status: OPERATIONAL, subState: OPERATIONAL }
+          warnings: []
+          elapsedMs: 4
+
+    ConfigurationFresh:
+      summary: Fresh configuration read — note the routing rule
+      description: |
+        `resource_configuration`'s required fields are exclusive to the
+        operational source, so rule 4 `fields.operational_only` fires — but it
+        **pins** the source and clears the configured fallback, then falls
+        through to the TTL rules rather than terminating. That is why the rule id
+        reported here is `ttl.operational.fresh` and not `fields.operational_only`.
+
+        Terminating at rule 4 would skip the `max_stale` ceiling for the one
+        request type that has nowhere else to go, and that ceiling is a safety
+        property rather than an optimisation. `fields.operational_only` is
+        emitted only when the operational source is unavailable, and then with
+        `routingDecision: NONE`.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          configuration:
+            autoscale: "true"
+            maxReplicas: "12"
+            region: eu-west-1
+          labels:
+            env: prod
+          observedAt: '2026-09-03T12:00:00.600Z'
+        meta:
+          correlationId: 0c9a4e11-7f2b-4d18-a3c6-52bb9e1f7a04
+          routingDecision: OPERATIONAL
+          routingRule: ttl.operational.fresh
+          sources: [OPERATIONAL, CACHE]
+          freshness:
+            state: FRESH
+            ageSeconds: 11.4
+            ttlSeconds: 30
+            observedAt: '2026-09-03T12:00:00.600Z'
+            evaluatedAt: '2026-09-03T12:00:12.000Z'
+            source: OPERATIONAL
+          degraded: false
+          partial: false
+          cache: { hit: true, layer: L1, ageMs: 2400 }
+          provenance: { configuration: OPERATIONAL }
+          warnings: []
+          elapsedMs: 1
+
+    # -------------------------------------------------------------- stale / degraded
+
+    ResourceStaleDegraded:
+      summary: Stale operational data served within max_stale (REQ-EDGE-002b)
+      description: |
+        `age = 112.0s` exceeded `ttl = 30s` but stayed within
+        `max_stale = 300s`, and no healthy fallback could supply the required
+        operational-only groups. Rule `ttl.operational.stale` branch (b) served
+        the operational record with `degraded: true`.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          customerId: cust-77
+          type: compute.instance
+          status: ACTIVE
+          subState: steady
+          configuration:
+            autoscale: "true"
+            maxReplicas: "12"
+          topology: { region: eu-west-1, zone: eu-west-1b, cluster: prod-3 }
+          observedAt: '2026-09-03T11:58:50.000Z'
+        meta:
+          correlationId: 8a4c7e90-2f11-4b3d-9e55-6c0a1b2d3e4f
+          routingDecision: OPERATIONAL
+          routingRule: ttl.operational.stale
+          sources: [OPERATIONAL]
+          freshness:
+            state: STALE
+            ageSeconds: 112.0
+            ttlSeconds: 30
+            observedAt: '2026-09-03T11:58:50.000Z'
+            evaluatedAt: '2026-09-03T12:00:42.000Z'
+            source: OPERATIONAL
+          degraded: true
+          partial: false
+          cache: { hit: false, layer: NONE }
+          provenance:
+            status: OPERATIONAL
+            configuration: OPERATIONAL
+            topology: OPERATIONAL
+          warnings:
+            - code: STALE_DATA
+              message: "the operational source's copy of this record is older than its freshness policy allows"
+              source: OPERATIONAL
+          elapsedMs: 9
+
+    StatusStaleDegraded:
+      summary: Stale status served with a clock-skew warning
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          status: DEGRADED
+          subState: reconciling
+          observedAt: '2026-09-03T11:59:52.400Z'
+        meta:
+          correlationId: 41b5d6a7-8c92-4e03-bb17-9f2e4a6c8d10
+          routingDecision: OPERATIONAL
+          routingRule: ttl.operational.stale
+          sources: [OPERATIONAL]
+          freshness:
+            state: STALE
+            ageSeconds: 47.5
+            ttlSeconds: 10
+            observedAt: '2026-09-03T11:59:52.400Z'
+            evaluatedAt: '2026-09-03T12:00:39.900Z'
+            source: OPERATIONAL
+            skewCorrected: true
+          degraded: true
+          partial: false
+          cache: { hit: false, layer: NONE }
+          provenance: { status: OPERATIONAL, subState: OPERATIONAL }
+          warnings:
+            - code: STALE_DATA
+              message: "the operational source's copy of this record is older than its freshness policy allows"
+              source: OPERATIONAL
+            - code: CLOCK_SKEW_DETECTED
+              message: "the data source's clock disagrees with this service's; the reported age has been corrected"
+              source: OPERATIONAL
+          elapsedMs: 7
+
+    StatusCacheStaleServed:
+      summary: Both sources down, stale cache served (REQ-EDGE-005, REQ-EDGE-011)
+      description: |
+        The routing decision was `NONE` (rule `health.both_unavailable`), so the
+        application layer fell to the last rung of the ladder and served an
+        expired-but-physically-resident entry through `Manager.GetStale`. The
+        rule id reported is `degrade.stale_cache` — the ladder's own id, not the
+        routing rule that produced the `NONE`.
+
+        Reaching it required all four gates at once: a degradable cause (or
+        `NO_SOURCE_AVAILABLE`), `allow_stale` on the request type, consistency
+        below `strong`, and an effective age within `max_stale = 120s`.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          status: ACTIVE
+          subState: steady
+          observedAt: '2026-09-03T12:00:01.000Z'
+        meta:
+          correlationId: c7e2b1a4-55d6-4f80-9137-2ab8c4e6f019
+          routingDecision: NONE
+          routingRule: degrade.stale_cache
+          sources: [CACHE, OPERATIONAL]
+          freshness:
+            state: STALE
+            ageSeconds: 38.0
+            ttlSeconds: 10
+            observedAt: '2026-09-03T12:00:01.000Z'
+            evaluatedAt: '2026-09-03T12:00:39.000Z'
+            source: OPERATIONAL
+          degraded: true
+          partial: false
+          cache: { hit: true, layer: L2, ageMs: 38000 }
+          warnings:
+            - code: STALE_DATA
+              message: 'every data source is currently unavailable; this response was served from cache and may be out of date'
+          elapsedMs: 2
+
+    ResourceFallbackExecution:
+      summary: 206 — stale operational data, routed to the execution source (REQ-EDGE-002a)
+      description: |
+        Rule `ttl.operational.stale` branch (a): a *current* answer from the slow
+        source beat a *stale* answer from the fast one. Freshness reports
+        `UNKNOWN`, not `FRESH` — only the operational source publishes a
+        freshness envelope, and an execution-sourced answer does not borrow its
+        verdict. `ageSeconds: 0` there means "no age could be established", which
+        is what `state: UNKNOWN` is telling you.
+
+        It is a `206`, not a `200`. `resource_read` asks for `configuration`,
+        `owner`, `metrics` and `topology` among others, and the execution source
+        is not a catalogued supplier of any of them, so those fields are absent
+        and `meta.partial` is `true`. A `200` here would tell the caller the body
+        is complete when it is not.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          status: PENDING
+          subState: applying
+        meta:
+          correlationId: 9d0e1f23-4a56-4b78-9c01-2d3e4f5a6b7c
+          routingDecision: EXECUTION
+          routingRule: ttl.operational.stale
+          sources: [EXECUTION]
+          freshness:
+            state: UNKNOWN
+            ageSeconds: 0
+            ttlSeconds: 30
+            evaluatedAt: '2026-09-03T12:00:41.900Z'
+            source: EXECUTION
+          degraded: false
+          partial: true
+          cache: { hit: false, layer: NONE }
+          provenance: { status: EXECUTION, subState: EXECUTION }
+          warnings:
+            - code: PARTIAL_DATA
+              message: 'this answer came from a source that does not hold every requested field; the remainder has been omitted'
+          elapsedMs: 168
+
+    # -------------------------------------------------------------- partial / fallback
+
+    ResourcePreflightFallback:
+      summary: 206 degraded — the operational source was unavailable pre-flight
+      description: |
+        Rule `health.primary_unavailable` fired: the breaker already knew the ODS
+        was unwell, so no doomed call was issued and the configured fallback
+        answered instead. That rung marks the answer `degraded: true` with a
+        `SOURCE_UNAVAILABLE` warning, exactly as the call-time
+        `fallback.primary_failed` rung does — the rule id is the only thing that
+        distinguishes them.
+
+        Note which source the warning names: **OPERATIONAL**, the one that
+        failed, not `EXECUTION`, the one that answered. That field is the first
+        thing an operator reads to find out which side broke.
+
+        It is a `206`. `aggregation.FanOut` did not mark it partial — the single
+        execution task succeeded — but the answer still cannot carry
+        `configuration`, `owner`, `metrics` or `topology`, because the execution
+        source is not a supplier of any of them.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          status: PENDING
+        meta:
+          correlationId: 5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9
+          routingDecision: EXECUTION
+          routingRule: health.primary_unavailable
+          sources: [EXECUTION]
+          freshness:
+            state: UNKNOWN
+            ageSeconds: 0
+            ttlSeconds: 30
+            evaluatedAt: '2026-09-03T12:00:42.000Z'
+            source: EXECUTION
+          degraded: true
+          partial: true
+          cache: { hit: false, layer: NONE }
+          provenance: { status: EXECUTION }
+          warnings:
+            - code: SOURCE_UNAVAILABLE
+              message: 'the preferred data source was unavailable; this answer came from the configured fallback source'
+              source: OPERATIONAL
+            - code: PARTIAL_DATA
+              message: 'this answer came from a source that does not hold every requested field; the remainder has been omitted'
+          elapsedMs: 143
+
+    DetailsComplete:
+      summary: BOTH fan-out, both branches succeeded
+      description: |
+        `ResourceDetails` embeds `Resource`, so the resource's own fields sit at
+        the top level of `data` alongside `latestExecution` and
+        `executionHistory` — there is no `data.resource` wrapper.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          customerId: cust-77
+          type: compute.instance
+          status: ACTIVE
+          subState: steady
+          owner: { id: team-platform, type: team, email: platform@example.com }
+          configuration: { autoscale: "true", maxReplicas: "12" }
+          metrics:
+            - { name: cpu_utilisation, value: 41.7, unit: percent, sampledAt: '2026-09-03T12:00:02.000Z' }
+          topology: { region: eu-west-1, zone: eu-west-1b, cluster: prod-3 }
+          observedAt: '2026-09-03T11:59:58.900Z'
+          latestExecution:
+            executionId: exec-8f21c4
+            tenantId: acme
+            resourceId: res-1042
+            operation: RECONFIGURE
+            status: COMPLETED
+            startedAt: '2026-09-03T11:58:12.004Z'
+            completedAt: '2026-09-03T11:59:41.771Z'
+            updatedAt: '2026-09-03T11:59:41.771Z'
+            result:
+              outcome: SUCCEEDED
+              summary: 'RECONFIGURE completed with state SUCCEEDED'
+              values: { durationSeconds: "90" }
+          executionHistory:
+            - executionId: exec-8f21c4
+              tenantId: acme
+              resourceId: res-1042
+              operation: RECONFIGURE
+              status: COMPLETED
+              startedAt: '2026-09-03T11:58:12.004Z'
+              completedAt: '2026-09-03T11:59:41.771Z'
+              updatedAt: '2026-09-03T11:59:41.771Z'
+        meta:
+          correlationId: aa11bb22-cc33-4d44-8e55-ff6677889900
+          routingDecision: BOTH
+          routingRule: fields.span_both
+          sources: [OPERATIONAL, EXECUTION]
+          freshness:
+            state: FRESH
+            ageSeconds: 12.4
+            ttlSeconds: 30
+            observedAt: '2026-09-03T11:59:58.900Z'
+            evaluatedAt: '2026-09-03T12:00:11.300Z'
+            source: OPERATIONAL
+          degraded: false
+          partial: false
+          cache: { hit: false, layer: NONE }
+          provenance:
+            status: OPERATIONAL
+            subState: OPERATIONAL
+            configuration: OPERATIONAL
+            metrics: OPERATIONAL
+            topology: OPERATIONAL
+            owner: OPERATIONAL
+            latestExecution: EXECUTION
+            executionHistory: EXECUTION
+          warnings: []
+          elapsedMs: 168
+
+    DetailsPartial:
+      summary: 206 — BOTH fan-out, optional execution branch timed out (REQ-EDGE-013)
+      description: |
+        The execution branch exceeded its `per_source_timeout.execution` budget
+        of 1500ms. Because `required_sources.execution` is `false` the request
+        still succeeds, and the operational branch was never cancelled
+        (REQ-AGG-002).
+
+        The status is `206`, not `200`: `response.Writer.OK` derives the status
+        from `meta.partial` alone, so *any* partial answer is a `206`. That is
+        what lets a cache or a dashboard tell a whole answer from a partial one
+        without parsing the body.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          status: ACTIVE
+          subState: steady
+          configuration: { autoscale: "true", maxReplicas: "12" }
+          topology: { region: eu-west-1, zone: eu-west-1b, cluster: prod-3 }
+          observedAt: '2026-09-03T12:00:07.200Z'
+        meta:
+          correlationId: bb22cc33-dd44-4e55-9f66-001122334455
+          routingDecision: OPERATIONAL
+          routingRule: fields.span_both
+          sources: [OPERATIONAL]
+          freshness:
+            state: FRESH
+            ageSeconds: 4.1
+            ttlSeconds: 30
+            observedAt: '2026-09-03T12:00:07.200Z'
+            evaluatedAt: '2026-09-03T12:00:11.300Z'
+            source: OPERATIONAL
+          degraded: false
+          partial: true
+          cache: { hit: false, layer: NONE }
+          provenance:
+            status: OPERATIONAL
+            subState: OPERATIONAL
+            configuration: OPERATIONAL
+            topology: OPERATIONAL
+          warnings:
+            - code: SOURCE_TIMEOUT
+              message: 'this source did not answer within its time budget and has been omitted'
+              source: EXECUTION
+          elapsedMs: 1512
+
+    DetailsRunningOverride:
+      summary: Running execution overrides operational status (REQ-PREC-003, REQ-EDGE-015)
+      description: |
+        The ODS reported `status: ACTIVE` while the EDS reported a `RUNNING`
+        execution. `precedence.execution_overrides_when_running: [status, subState]`
+        gave both fields to the execution source and
+        `precedence_conflict_total` was incremented.
+
+        This is the **only** way execution data can outrank operational data.
+        Precedence never uses recency: the EDS can legitimately hold a newer
+        timestamp for a status it is merely *predicting* from a workflow, while
+        the ODS holds the older but observed truth.
+
+        The override needs an execution candidate that is **actually** in
+        progress. `data.inFlightExecutionId` alone does not grant it: a marker
+        left behind by a finished workflow is reported but ignored, which is what
+        stops a completed run's predicted status from outranking the operational
+        source's observed one.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          status: DEGRADED
+          subState: applying
+          configuration: { autoscale: "true", maxReplicas: "12" }
+          topology: { region: eu-west-1, zone: eu-west-1b, cluster: prod-3 }
+          inFlightExecutionId: exec-9c40de
+          observedAt: '2026-09-03T12:00:32.100Z'
+          latestExecution:
+            executionId: exec-9c40de
+            tenantId: acme
+            resourceId: res-1042
+            operation: RECONFIGURE
+            status: RUNNING
+            startedAt: '2026-09-03T11:58:12.004Z'
+            updatedAt: '2026-09-03T12:00:41.771Z'
+            steps:
+              - { id: validate, name: Validate request, sequence: 1, status: COMPLETED, attempt: 1 }
+              - { id: apply, name: Apply change, sequence: 2, status: RUNNING, attempt: 1 }
+        meta:
+          correlationId: cc33dd44-ee55-4f66-a077-112233445566
+          routingDecision: BOTH
+          routingRule: fields.span_both
+          sources: [OPERATIONAL, EXECUTION]
+          freshness:
+            state: FRESH
+            ageSeconds: 9.8
+            ttlSeconds: 30
+            observedAt: '2026-09-03T12:00:32.100Z'
+            evaluatedAt: '2026-09-03T12:00:41.900Z'
+            source: OPERATIONAL
+          degraded: false
+          partial: false
+          cache: { hit: false, layer: NONE }
+          provenance:
+            status: EXECUTION
+            subState: EXECUTION
+            configuration: OPERATIONAL
+            topology: OPERATIONAL
+            latestExecution: EXECUTION
+          warnings:
+            - code: CONFLICT_RESOLVED
+              message: 'the two sources reported different values for status; precedence policy selected EXECUTION'
+              source: EXECUTION
+          elapsedMs: 174
+
+    DetailsExecutionUnavailable:
+      summary: 206 — BOTH fan-out, the optional execution branch was unavailable
+      description: |
+        The other realistic `206` for this endpoint: the execution branch failed
+        outright rather than timing out, so the warning is `SOURCE_UNAVAILABLE`
+        instead of `SOURCE_TIMEOUT`.
+
+        The *required* operational branch failing does not produce a `206` here.
+        It aborts the fan-out, and `resource_details` configures
+        `fallback: operational` — which equals the primary — so
+        `fallbackDecision` refuses and the request goes straight to the stale
+        ladder: `degrade.stale_cache` if an entry is within `max_stale`, else
+        `503`.
+      value:
+        data:
+          tenantId: acme
+          resourceId: res-1042
+          customerId: cust-77
+          type: compute.instance
+          status: ACTIVE
+          subState: steady
+          configuration: { autoscale: "true", maxReplicas: "12" }
+          topology: { region: eu-west-1, zone: eu-west-1b, cluster: prod-3 }
+          observedAt: '2026-09-03T12:00:36.900Z'
+        meta:
+          correlationId: dd44ee55-ff66-4077-8188-223344556677
+          routingDecision: OPERATIONAL
+          routingRule: fields.span_both
+          sources: [OPERATIONAL]
+          freshness:
+            state: FRESH
+            ageSeconds: 5.1
+            ttlSeconds: 30
+            observedAt: '2026-09-03T12:00:36.900Z'
+            evaluatedAt: '2026-09-03T12:00:42.000Z'
+            source: OPERATIONAL
+          degraded: false
+          partial: true
+          cache: { hit: false, layer: NONE }
+          provenance:
+            status: OPERATIONAL
+            subState: OPERATIONAL
+            configuration: OPERATIONAL
+            topology: OPERATIONAL
+          warnings:
+            - code: SOURCE_UNAVAILABLE
+              message: 'data from this source could not be retrieved and has been omitted'
+              source: EXECUTION
+          elapsedMs: 12
+
+    # -------------------------------------------------------------- executions
+
+    ExecutionHistoryPage:
+      summary: Execution history page (always live, ttl 0 / cache_ttl 0)
+      description: |
+        `execution_history` is configured `ttl: 0s` and `cache_ttl: 0s`, so this
+        response is never cached and never stale-served. Freshness is `UNKNOWN`
+        with `ttlSeconds: 0`: execution data is a record of what happened, not a
+        cache of current state, and reporting `FRESH` would imply a guarantee the
+        source does not make.
+      value:
+        data:
+          resourceId: res-1042
+          items:
+            - executionId: exec-9c40de
+              tenantId: acme
+              resourceId: res-1042
+              operation: RECONFIGURE
+              status: RUNNING
+              startedAt: '2026-09-03T11:58:12.004Z'
+              updatedAt: '2026-09-03T12:00:41.771Z'
+            - executionId: exec-8f21c4
+              tenantId: acme
+              resourceId: res-1042
+              operation: RESIZE
+              status: COMPLETED
+              startedAt: '2026-09-02T09:14:02.100Z'
+              completedAt: '2026-09-02T09:15:44.900Z'
+              updatedAt: '2026-09-02T09:15:44.900Z'
+              result: { outcome: SUCCEEDED, summary: 'RESIZE completed with state SUCCEEDED' }
+          total: 7
+          nextCursor: "2"
+        meta:
+          correlationId: ee55ff66-0077-4188-9299-334455667788
+          routingDecision: EXECUTION
+          routingRule: fields.execution_only
+          sources: [EXECUTION]
+          freshness:
+            state: UNKNOWN
+            ageSeconds: 0
+            ttlSeconds: 0
+            evaluatedAt: '2026-09-03T12:00:41.900Z'
+            source: EXECUTION
+          degraded: false
+          partial: false
+          cache: { hit: false, layer: NONE }
+          warnings: []
+          elapsedMs: 141
+
+    ExecutionHistoryEmpty:
+      summary: Existing resource with no executions — 200, not 404 (REQ-EDGE-019b)
+      description: |
+        An empty collection is an answer, so it is a `200` with an empty `items`
+        array. There is no warning code for it: `EMPTY_RESULT` is not part of the
+        canonical warning vocabulary.
+      value:
+        data:
+          resourceId: res-1042
+          items: []
+          total: 0
+        meta:
+          correlationId: ff660077-1188-4299-a3aa-445566778899
+          routingDecision: EXECUTION
+          routingRule: fields.execution_only
+          sources: [EXECUTION]
+          freshness:
+            state: UNKNOWN
+            ageSeconds: 0
+            ttlSeconds: 0
+            evaluatedAt: '2026-09-03T12:00:42.100Z'
+            source: EXECUTION
+          degraded: false
+          partial: false
+          cache: { hit: false, layer: NONE }
+          warnings: []
+          elapsedMs: 133
+
+    ExecutionRunning:
+      summary: A running execution
+      value:
+        data:
+          executionId: exec-9c40de
+          tenantId: acme
+          resourceId: res-1042
+          customerId: cust-77
+          operation: RECONFIGURE
+          status: RUNNING
+          startedAt: '2026-09-03T11:58:12.004Z'
+          updatedAt: '2026-09-03T12:00:41.771Z'
+          steps:
+            - { id: validate, name: Validate request, sequence: 1, status: COMPLETED, startedAt: '2026-09-03T11:58:12.100Z', completedAt: '2026-09-03T11:58:19.400Z', attempt: 1 }
+            - { id: apply, name: Apply change, sequence: 2, status: RUNNING, startedAt: '2026-09-03T11:58:19.500Z', attempt: 1 }
+          actions:
+            - { id: a1, type: api.call, target: res-1042, outcome: ok, performedAt: '2026-09-03T11:58:22.000Z', performedBy: workflow-engine }
+        meta:
+          correlationId: 00771188-2299-43aa-b4bb-556677889900
+          routingDecision: EXECUTION
+          routingRule: fields.execution_only
+          sources: [EXECUTION]
+          freshness:
+            state: UNKNOWN
+            ageSeconds: 0
+            ttlSeconds: 0
+            evaluatedAt: '2026-09-03T12:00:41.900Z'
+            source: EXECUTION
+          degraded: false
+          partial: false
+          cache: { hit: false, layer: NONE }
+          warnings: []
+          elapsedMs: 139
+
+    ExecutionFailed:
+      summary: A failed execution
+      value:
+        data:
+          executionId: exec-771abc
+          tenantId: acme
+          resourceId: res-1042
+          operation: RECONFIGURE
+          status: FAILED
+          startedAt: '2026-09-03T10:02:00.000Z'
+          completedAt: '2026-09-03T10:04:11.200Z'
+          updatedAt: '2026-09-03T10:04:11.200Z'
+          error:
+            code: DOWNSTREAM_REJECTED
+            message: 'the target system rejected the change'
+            retryable: false
+            step: apply
+        meta:
+          correlationId: 11882299-33aa-44bb-85cc-6677889900aa
+          routingDecision: EXECUTION
+          routingRule: fields.execution_only
+          sources: [EXECUTION]
+          freshness:
+            state: UNKNOWN
+            ageSeconds: 0
+            ttlSeconds: 0
+            evaluatedAt: '2026-09-03T12:00:42.000Z'
+            source: EXECUTION
+          degraded: false
+          partial: false
+          cache: { hit: false, layer: NONE }
+          warnings: []
+          elapsedMs: 137
+
+    # -------------------------------------------------------------- errors
+    #
+    # `error.title` is the taxonomy's own title, from response.errorTitles;
+    # `error.detail` is the taxonomy's own message and never contains an
+    # upstream hostname, credential or schema fragment (REQ-SEC-009). The
+    # wrapped cause is logged, never sent.
+
+    ErrNotFound:
+      summary: Resource absent from every consulted source (REQ-EDGE-019a)
+      value:
+        error:
+          code: NOT_FOUND
+          type: https://errors.bff.internal/not-found
+          title: Not found
+          status: 404
+          detail: 'resource not found'
+          correlationId: 22994a3a-44bb-455c-a66d-77ee88ff0011
+          retryable: false
+          sources:
+            - { source: OPERATIONAL, state: HEALTHY }
+            - { source: EXECUTION, state: HEALTHY }
+
+    ErrInvalidRequest:
+      summary: Rejected query parameter (REQ-API-014)
+      description: |
+        An unrecognised query parameter is a `400`, not something to ignore: a
+        typo in a client's URL should surface as an error rather than as
+        silently different behaviour. The accepted set is `fields`,
+        `consistency`, `limit`, `cursor` and `includeAudit`.
+      value:
+        error:
+          code: INVALID_REQUEST
+          type: https://errors.bff.internal/invalid-request
+          title: Invalid request
+          status: 400
+          detail: 'limit must be a positive integer'
+          correlationId: 33aa44bb-55cc-46dd-97ee-88ff00112233
+          retryable: false
+
+    ErrTenantMissing:
+      summary: No tenant could be resolved (rule guard.tenant_missing)
+      value:
+        error:
+          code: INVALID_REQUEST
+          type: https://errors.bff.internal/invalid-request
+          title: Invalid request
+          status: 400
+          detail: 'no data source can currently satisfy this request'
+          correlationId: 44bb55cc-66dd-47ee-88ff-001122334455
+          retryable: false
+
+    ErrUnauthenticated:
+      summary: Expired token
+      value:
+        error:
+          code: UNAUTHENTICATED
+          type: https://errors.bff.internal/unauthenticated
+          title: Authentication required
+          status: 401
+          detail: 'missing or invalid credentials'
+          correlationId: 55cc66dd-77ee-48ff-9900-112233445566
+          retryable: false
+
+    ErrForbidden:
+      summary: Role lacks the required permission (REQ-SEC-005)
+      value:
+        error:
+          code: FORBIDDEN
+          type: https://errors.bff.internal/forbidden
+          title: Access denied
+          status: 403
+          detail: 'the caller is not permitted to read audit information'
+          correlationId: 66dd77ee-88ff-4900-a112-233445566778
+          retryable: false
+
+    ErrTenantMismatch:
+      summary: X-Tenant-ID disagrees with the token claim (REQ-SEC-004)
+      value:
+        error:
+          code: TENANT_MISMATCH
+          type: https://errors.bff.internal/tenant-mismatch
+          title: Tenant mismatch
+          status: 403
+          detail: 'tenant context does not match credentials'
+          correlationId: 77ee88ff-0011-4223-8445-566778899aab
+          retryable: false
+
+    ErrRateLimited:
+      summary: Per-tenant token bucket exhausted (REQ-RES-008)
+      value:
+        error:
+          code: RATE_LIMITED
+          type: https://errors.bff.internal/rate-limited
+          title: Rate limit exceeded
+          status: 429
+          detail: 'request rate limit exceeded'
+          correlationId: 88ff0011-2233-4445-a667-78899aabbccd
+          retryable: true
+
+    ErrUpstreamTimeout:
+      summary: Required source exceeded its deadline (REQ-EDGE-013)
+      value:
+        error:
+          code: UPSTREAM_TIMEOUT
+          type: https://errors.bff.internal/upstream-timeout
+          title: Upstream data source timed out
+          status: 504
+          detail: 'the execution source did not answer within its time budget'
+          correlationId: 99001122-3344-4556-8778-899aabbccdde
+          retryable: true
+          sources:
+            - { source: OPERATIONAL, state: HEALTHY }
+            - { source: EXECUTION, state: SATURATED }
+
+    ErrUpstreamUnavailable:
+      summary: Required source unavailable with no fallback (REQ-EDGE-004)
+      value:
+        error:
+          code: UPSTREAM_UNAVAILABLE
+          type: https://errors.bff.internal/upstream-unavailable
+          title: Upstream data source unavailable
+          status: 503
+          detail: 'data source temporarily unavailable'
+          correlationId: aa112233-4455-4667-8889-9aabbccddeef
+          retryable: true
+          sources:
+            - { source: OPERATIONAL, state: HEALTHY }
+            - { source: EXECUTION, state: CIRCUIT_OPEN }
+
+    ErrNoSourceAvailable:
+      summary: Both sources down, no stale candidate (REQ-EDGE-005)
+      value:
+        error:
+          code: NO_SOURCE_AVAILABLE
+          type: https://errors.bff.internal/no-source-available
+          title: No data source can satisfy this request
+          status: 503
+          detail: 'no data source can currently satisfy this request'
+          correlationId: bb223344-5566-4778-899a-abbccddeeff0
+          retryable: true
+          sources:
+            - { source: OPERATIONAL, state: CIRCUIT_OPEN }
+            - { source: EXECUTION, state: CIRCUIT_OPEN }
+
+    ErrUpstreamInvalid:
+      summary: Undecodable or semantically invalid source payload (REQ-EDGE-020)
+      value:
+        error:
+          code: UPSTREAM_INVALID_RESPONSE
+          type: https://errors.bff.internal/upstream-invalid-response
+          title: Upstream data source returned an invalid response
+          status: 502
+          detail: 'the operational source returned a record that could not be interpreted'
+          correlationId: cc334455-6677-4889-9aab-bccddeeff001
+          retryable: false
+          sources:
+            - { source: OPERATIONAL, state: HEALTHY }
+            - { source: EXECUTION, state: HEALTHY }
+
+    ErrSchemaMismatch:
+      summary: Unsupported source schema version (REQ-EDGE-017)
+      description: |
+        Note the source states: both breakers are **HEALTHY**. A schema mismatch
+        deliberately does not trip a circuit breaker — the source is up, fast and
+        answering correctly, and it is the BFF that does not understand the
+        contract. Tripping the breaker would reroute every request to the slower
+        source and replace a specific version-incompatibility alert with a vague
+        availability one.
+
+        `errs.SourceUnusable` is nonetheless true for this code, so a request
+        type with a configured fallback takes the call-time fallback and returns
+        `200` degraded instead of this document. This `502` is what the endpoints
+        with `fallback: none` return.
+      value:
+        error:
+          code: SCHEMA_VERSION_MISMATCH
+          type: https://errors.bff.internal/schema-version-mismatch
+          title: Upstream schema version is not supported
+          status: 502
+          detail: 'the execution source declared a contract version this service does not accept'
+          correlationId: dd445566-7788-499a-abbc-cddeeff00112
+          retryable: false
+          sources:
+            - { source: OPERATIONAL, state: HEALTHY }
+            - { source: EXECUTION, state: HEALTHY }

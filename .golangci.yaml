@@ -1,0 +1,307 @@
+# golangci-lint configuration for the TTL-aware BFF.
+#
+# Strict but practical. The rule for adding a linter here: it must catch a
+# class of bug that has actually bitten a service like this one, and its false
+# positives must be suppressible with a targeted nolint rather than a blanket
+# exclusion.
+#
+#   make lint          run everything below
+#   make lint-fix      apply the auto-fixable subset
+#
+# Schema: golangci-lint v1.62 (config version 1).
+
+run:
+  timeout: 5m
+  # Test files are linted too. Test code that is wrong is still wrong, and a
+  # leaked goroutine or an ignored error in a test is exactly how a flake is
+  # born. The per-path exclusions further down relax the rules that genuinely
+  # do not apply to tests.
+  tests: true
+  # Build tags used by the integration and contract suites, so their files are
+  # type-checked rather than skipped.
+  build-tags:
+    - integration
+    - contract
+  modules-download-mode: readonly
+  # Fail rather than silently lint a subset when a package does not compile.
+  allow-parallel-runners: false
+
+output:
+  formats:
+    - format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+  sort-results: true
+
+linters:
+  # Explicit list rather than presets: a preset that grows on upgrade turns a
+  # dependency bump into an unrelated lint failure.
+  disable-all: true
+  enable:
+    # --- Correctness -----------------------------------------------------
+    - govet           # the standard vet suite, including shadow (below)
+    - errcheck        # unchecked errors — the single highest-value linter here
+    - staticcheck     # the SA/S/ST families
+    - ineffassign     # assignments never read
+    - unused          # dead code
+    - bodyclose       # unclosed HTTP response bodies leak connections; the BFF
+                      # is an HTTP client on every request, so this matters
+    - contextcheck    # a function that should propagate ctx but does not —
+                      # directly relevant to per-source timeouts and cancellation
+    - errorlint       # %w vs %v, errors.Is/As over == and type assertions
+    - nilerr          # returning nil after checking err != nil
+    - rowserrcheck    # database/sql rows.Err(); harmless if no SQL appears
+    - durationcheck   # multiplying two durations, a classic TTL arithmetic bug
+
+    # --- Security --------------------------------------------------------
+    - gosec
+
+    # --- Style and maintainability ---------------------------------------
+    - revive          # the golint successor; rules configured below
+    - gocritic
+    - misspell
+    - unconvert       # redundant type conversions
+    - unparam         # always-the-same parameters and unused results
+    - prealloc        # slices grown in a loop with a known length
+    - nolintlint      # every nolint must be specific and explained
+    - gofmt
+    - goimports
+    - whitespace
+    - copyloopvar     # Go 1.22+ made this mostly moot; catches the leftovers
+
+linters-settings:
+  govet:
+    enable-all: true
+    disable:
+      # fieldalignment optimises struct layout for memory. Real, but it fights
+      # readability in the config and domain structs, and the BFF's allocation
+      # profile is dominated by response JSON, not struct padding.
+      - fieldalignment
+    settings:
+      shadow:
+        # Only flag a shadow that traps a declaration, not every `err :=` in a
+        # nested scope. Without this, idiomatic Go produces hundreds of hits.
+        strict: false
+
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+    exclude-functions:
+      # Writing to an http.ResponseWriter after the header is sent cannot be
+      # usefully handled; the error is logged by the server itself.
+      - (net/http.ResponseWriter).Write
+      # Buffer writes never fail.
+      - (*bytes.Buffer).Write
+      - (*bytes.Buffer).WriteString
+      - (*strings.Builder).Write
+      - (*strings.Builder).WriteString
+
+  staticcheck:
+    checks:
+      - "all"
+      # ST1000: package comment on every package. Valuable, but noisy on the
+      # small internal packages; the package map in the design contract already
+      # documents them.
+      - "-ST1000"
+      # ST1003: initialisms. The generated protobuf code and the JSON field
+      # names in the contract (latestExecution, executionHistory) do not
+      # negotiate.
+      - "-ST1003"
+
+  revive:
+    severity: warning
+    # Only the rules listed are enabled, so a revive upgrade cannot introduce a
+    # new failure without a config change.
+    enable-all-rules: false
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+        arguments:
+          - allowTypesBefore: "*testing.T"
+      - name: context-keys-type
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: exported
+        arguments: ["checkPrivateReceivers", "disableStutteringCheck"]
+      - name: if-return
+      - name: increment-decrement
+      - name: var-naming
+      - name: package-comments
+        disabled: true
+      - name: range
+      - name: receiver-naming
+      - name: indent-error-flow
+      - name: errorf
+      - name: empty-block
+      - name: superfluous-else
+      - name: unreachable-code
+      - name: redefines-builtin-id
+      - name: unused-parameter
+        # `_ = ctx` is worse than an unused named parameter that documents what
+        # the argument is.
+        arguments:
+          - allowRegex: "^_"
+      - name: early-return
+      - name: defer
+        arguments:
+          - ["loop", "return", "recover"]
+      # Guard against the thing this codebase is most at risk of: a deeply
+      # nested routing decision that nobody can follow.
+      - name: cognitive-complexity
+        arguments: [25]
+      - name: function-length
+        arguments: [90, 0]
+
+  gosec:
+    excludes:
+      # G104 duplicates errcheck, which is configured more precisely above.
+      - G104
+      # G102: binding to all interfaces. The BFF binds :8080 and :9090 on
+      # 0.0.0.0 by design — it runs in a pod behind a Service, not on a shared
+      # host, and binding to loopback would make it unreachable.
+      - G102
+      # G404: math/rand. Used for retry jitter, where cryptographic randomness
+      # buys nothing and is measurably slower on the request path.
+      - G404
+    severity: medium
+    confidence: medium
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+      - opinionated
+    disabled-checks:
+      # Fires on every `if err != nil { return err } else {` refactor
+      # suggestion that revive's indent-error-flow already covers.
+      - ifElseChain
+      # Wants every 2-arg struct literal keyed; noisy in table-driven tests.
+      - unnamedResult
+      # Prefers `switch` over an if-chain even when the if-chain reads better,
+      # which the routing rule chain does.
+      - singleCaseSwitch
+    settings:
+      hugeParam:
+        # Domain structs (Resource, ResourceDetails) are legitimately large and
+        # are passed by value in the mappers for immutability.
+        sizeThreshold: 512
+      rangeValCopy:
+        sizeThreshold: 256
+
+  misspell:
+    locale: US
+    ignore-words:
+      - cancelled   # the contract's ExecutionStatus enum uses the UK spelling
+
+  nolintlint:
+    # A bare `//nolint` is a rule that has been silently switched off forever.
+    require-explanation: true
+    require-specific: true
+    allow-unused: false
+
+  prealloc:
+    simple: true
+    range-loops: true
+    for-loops: false
+
+  unparam:
+    # Report exported functions too: an always-nil error return in a port
+    # interface misleads every caller.
+    check-exported: false
+
+  goimports:
+    local-prefixes: github.com/udaykishore/ttl-aware-bff
+
+issues:
+  # Defaults hide a lot. Everything enabled above is meant to be seen.
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # Only report issues introduced since this ref when running locally; CI
+  # overrides this with --new=false so the full tree is checked.
+  new: false
+
+  exclude-rules:
+    # --- Test files ------------------------------------------------------
+    - path: _test\.go
+      linters:
+        # Assertion helpers and table entries legitimately return values
+        # nobody reads.
+        - unparam
+        # Test fixtures are allowed to be long and repetitive; splitting them
+        # up usually makes them harder to read, not easier.
+        - gocritic
+        - dupl
+        # A test binding a listener, using a weak RNG for a fixture, or reading
+        # a file by a constructed path is not a vulnerability.
+        - gosec
+        # Preallocating a 3-element slice in a test is noise.
+        - prealloc
+        # Long table-driven tests are the point.
+        - revive
+
+    # Test helpers may ignore a Close error in a defer.
+    - path: _test\.go
+      linters:
+        - errcheck
+      text: "Error return value of .*(Close|Flush|Shutdown). is not checked"
+
+    # --- Generated code ---------------------------------------------------
+    # protoc output is not ours to lint.
+    - path: internal/datasource/operational/opsv1/
+      linters:
+        - all
+
+    - path: \.pb\.go$
+      linters:
+        - all
+
+    # --- Test utilities ---------------------------------------------------
+    # testutil is test code that happens not to live in a _test.go file.
+    - path: internal/testutil/
+      linters:
+        - gosec
+        - unparam
+        - revive
+
+    # --- cmd/ -------------------------------------------------------------
+    # main() wires everything together; it is long by nature and splitting it
+    # into helpers that are each called once makes start-up harder to follow.
+    - path: ^cmd/
+      linters:
+        - revive
+      text: "function-length"
+
+    # --- Documented, deliberate exceptions --------------------------------
+    # The freshness manager compares wall-clock timestamps from a remote source
+    # against local time on purpose; that is the clock-skew correction, not a
+    # bug.
+    - path: internal/freshness/
+      linters:
+        - durationcheck
+      text: "Multiplication of durations"
+
+  # A fixed set of paths golangci-lint should not walk at all.
+  exclude-dirs:
+    - third_party
+    - vendor
+    - deploy
+    - docs
+    - spec
+
+  exclude-files:
+    - ".*\\.pb\\.go$"
+    - ".*\\.pb\\.gw\\.go$"
+
+severity:
+  default-severity: error
+  rules:
+    # Style feedback should not fail a build on its own; correctness should.
+    - linters:
+        - misspell
+        - whitespace
+        - prealloc
+      severity: warning

@@ -1,0 +1,723 @@
+# Default values for the ttl-aware-bff chart.
+#
+# These defaults are PRODUCTION-SHAPED: 3 replicas, a restricted security
+# context, real resource requests, 10% trace sampling. values-dev.yaml relaxes
+# them; values-prod.yaml pins the environment-specific identifiers. A install
+# that forgets its values file therefore fails safe rather than fails open.
+#
+# Ports, image names, config keys, the BFF_ environment scheme and the metric
+# names below are all fixed by docs/DESIGN-CONTRACT.md. Do not change them here
+# without changing the contract.
+
+# ---------------------------------------------------------------------------
+# Naming
+# ---------------------------------------------------------------------------
+# By default resources are named "<release>-ttl-aware-bff", except when the
+# release is itself called ttl-aware-bff, in which case the name is used as-is.
+# Set fullnameOverride to pin the exact name (the plain manifests in
+# deploy/k8s use "ttl-aware-bff").
+nameOverride: ""
+fullnameOverride: ""
+
+# Extra labels/annotations added to every object the chart renders.
+commonLabels: {}
+commonAnnotations: {}
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image:
+  repository: ghcr.io/udaykishore/ttl-aware-bff
+  # Empty means "use .Chart.AppVersion". Prefer a digest in production:
+  #   tag: ""
+  #   digest: "sha256:..."
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Only needed for a private registry. GHCR public packages need none.
+#   imagePullSecrets:
+#     - name: ghcr-credentials
+imagePullSecrets: []
+
+# ---------------------------------------------------------------------------
+# Replicas and autoscaling
+# ---------------------------------------------------------------------------
+# Used only when autoscaling.enabled is false. When the HPA is on, the
+# Deployment omits spec.replicas entirely so `helm upgrade` cannot undo a
+# scale-up.
+replicaCount: 3
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 30
+
+  # Percentage of the CPU *request* (not the limit).
+  targetCPUUtilizationPercentage: 70
+  # Set to null to disable the memory metric. Memory is a poor scaling signal
+  # for a Go service — the GC will happily use whatever it is given — so it is
+  # off by default.
+  targetMemoryUtilizationPercentage: null
+
+  # The contract's UpDownCounter (docs/DESIGN-CONTRACT.md §7), exposed through
+  # custom.metrics.k8s.io by prometheus-adapter or KEDA. This is the signal
+  # that matters for a BFF: in-flight requests climb as soon as an upstream
+  # slows, long before CPU reacts, because the load is goroutines parked on I/O.
+  #
+  # 40 in-flight per pod is ~60% of the combined bulkhead capacity configured
+  # under config.sources (operational 64 + execution 32).
+  customMetric:
+    enabled: true
+    name: bff_concurrent_requests
+    averageValue: "40"
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+      selectPolicy: Min
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+# No CPU limit by design. CFS throttling at the limit adds tail latency to a
+# latency-sensitive read path, and the effective ceiling is already set by the
+# request-based scheduling plus the HPA. Memory IS limited, because it is
+# incompressible and an unbounded leak would take the node with it.
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+    ephemeral-storage: 128Mi
+  limits:
+    memory: 1Gi
+    ephemeral-storage: 512Mi
+
+# GOMEMLIMIT: a soft ceiling that makes the GC work harder before the kernel
+# OOM-kills the pod. Rule of thumb is ~80% of resources.limits.memory. Leave
+# empty to omit the variable entirely.
+goMemLimit: "800MiB"
+
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/os
+              operator: In
+              values: ["linux"]
+            - key: kubernetes.io/arch
+              operator: In
+              values: ["amd64", "arm64"]
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ttl-aware-bff
+
+# Zone spread is hard (an AZ loss must cost at most one "slot" of skew); node
+# spread is soft so a scale-up is never blocked by a small cluster.
+# The chart injects the labelSelector — list only maxSkew/topologyKey/
+# whenUnsatisfiable here.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+# maxUnavailable: 0 keeps capacity flat through a rollout; maxSurge: 1 pays for
+# it with one extra pod.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# ---------------------------------------------------------------------------
+# Pod metadata and security
+# ---------------------------------------------------------------------------
+# The chart always adds checksum/config and checksum/secret annotations so a
+# config change rolls the Deployment. Anything here is merged on top.
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  # 65532 is distroless' `nonroot` user. Numeric so the kubelet can enforce
+  # runAsNonRoot without resolving a name inside the image.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Satisfies the `restricted` Pod Security Standard with no exceptions.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+# Shutdown arithmetic — keep these three consistent:
+#   preStopSleepSeconds (10) + config.server.shutdown_grace (25s)
+#     < terminationGracePeriodSeconds (45)
+# The preStop sleep exists because endpoint withdrawal and SIGTERM race; the
+# sleep lets the load balancer stop sending new connections first.
+terminationGracePeriodSeconds: 45
+preStopSleepSeconds: 10
+
+serviceAccount:
+  create: true
+  name: ""
+  # IRSA. Terraform emits the real value as the `bff_irsa_role_arn` output.
+  roleArn: "arn:aws:iam::000000000000:role/ttl-aware-bff-irsa"
+  # The BFF never calls the Kubernetes API. IRSA's own token is a separate
+  # projected volume and is unaffected by this.
+  automountServiceAccountToken: false
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Probes — all on the admin port (9090)
+# ---------------------------------------------------------------------------
+# /healthz  process up, config parsed          -> startup
+# /readyz   dependencies usable, drain-aware   -> readiness
+# /livez    event loop responsive              -> liveness
+#
+# Liveness is deliberately more forgiving than readiness: a slow upstream must
+# cost readiness, never a restart.
+probes:
+  startup:
+    enabled: true
+    path: /healthz
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 30      # 30 * 2s = up to 60s to warm up
+  readiness:
+    enabled: true
+    path: /readyz
+    periodSeconds: 5
+    timeoutSeconds: 2
+    successThreshold: 1
+    failureThreshold: 3
+  liveness:
+    enabled: true
+    path: /livez
+    periodSeconds: 10
+    timeoutSeconds: 2
+    successThreshold: 1
+    failureThreshold: 6
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  # Ports are fixed by the contract: 8080 public API, 9090 admin.
+  httpPort: 8080
+  adminPort: 9090
+  annotations: {}
+  # Adds a headless Service for per-pod DNS (port-forward, direct pprof).
+  headless:
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# Ingress (AWS Load Balancer Controller)
+# ---------------------------------------------------------------------------
+# Only the API port is ever routed. The admin port carries /metrics and the
+# probes and must not be reachable from outside.
+ingress:
+  enabled: true
+  className: alb
+  host: bff.example.com
+  path: /api/v1
+  pathType: Prefix
+
+  tls:
+    enabled: true
+    secretName: ttl-aware-bff-tls
+
+  alb:
+    scheme: internet-facing
+    # `ip` targets pod IPs directly: one fewer hop, and the ALB's health check
+    # becomes the source of truth that makes the preStop drain work.
+    targetType: ip
+    groupName: bff-public
+    groupOrder: 10
+    loadBalancerName: ttl-aware-bff-alb
+    certificateArn: "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+    sslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # Empty string means "do not attach a Web ACL". Leaving a public ALB
+    # unprotected is a deliberate decision, not a default.
+    wafAclArn: "arn:aws:wafv2:us-east-1:000000000000:regional/webacl/ttl-aware-bff-waf/00000000-0000-0000-0000-000000000000"
+    shieldAdvanced: false
+    healthcheck:
+      path: /readyz
+      port: "9090"
+      intervalSeconds: 10
+      timeoutSeconds: 5
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+    # Must be >= terminationGracePeriodSeconds or the ALB stops draining before
+    # the pod finishes serving.
+    deregistrationDelaySeconds: 60
+    idleTimeoutSeconds: 60
+    accessLogsBucket: ttl-aware-bff-alb-logs
+
+  # Merged last, so anything here wins over the generated annotations above.
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# PodDisruptionBudget
+# ---------------------------------------------------------------------------
+# Voluntary disruptions only (node drains, autoscaler consolidation). Set
+# exactly one of maxUnavailable / minAvailable.
+pdb:
+  enabled: true
+  maxUnavailable: 1
+  minAvailable: null
+  # Keeps an already-broken fleet from wedging a node drain forever.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+
+# ---------------------------------------------------------------------------
+# NetworkPolicy
+# ---------------------------------------------------------------------------
+# Requires an enforcing CNI. The AWS VPC CNI ignores NetworkPolicy unless
+# `enableNetworkPolicy=true` is set on the aws-node addon — verify before
+# relying on this.
+networkPolicy:
+  enabled: true
+  # Adds a namespace-wide deny-all so the rules below become an allow-list
+  # rather than an addition to an open default.
+  denyAll: true
+  # Pod/node CIDR the ALB, kubelet and ElastiCache live in. Narrow this to the
+  # actual private subnet CIDRs (Terraform `private_subnet_cidrs` output).
+  clusterCidr: 10.0.0.0/16
+  dns:
+    namespace: kube-system
+    podSelectorLabels:
+      k8s-app: kube-dns
+  monitoringNamespaces:
+    - monitoring
+    - observability
+  # Extra egress rules appended verbatim. Use this for an internet-hosted JWKS
+  # endpoint rather than opening 0.0.0.0/0.
+  extraEgress: []
+
+# ---------------------------------------------------------------------------
+# ServiceMonitor (Prometheus Operator)
+# ---------------------------------------------------------------------------
+serviceMonitor:
+  enabled: true
+  # kube-prometheus-stack only adopts ServiceMonitors carrying its release
+  # label. Wrong value here = object created and silently ignored.
+  labels:
+    release: kube-prometheus-stack
+  # Matches config.observability.metrics_interval so Prometheus never samples
+  # the same OTel export window twice.
+  interval: 15s
+  scrapeTimeout: 10s
+  # Go runtime and process collectors are already covered by cAdvisor and
+  # multiply cardinality across a 30-replica fleet.
+  dropMetricsRegex: "go_.*|process_.*|promhttp_.*"
+  # Caps tenant_id length: a per-tenant label is what makes these metrics
+  # useful, but a bug putting a request id there would take Prometheus down.
+  tenantLabelMaxLength: 64
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+# The BFF never reads a credential path from config. Config carries the NAME of
+# the env var holding a credential (config.cache.redis.password_env,
+# config.security.jwt.hs256_secret_env) and the value arrives as an env var.
+#
+# Three ways to supply it, in order of preference:
+#   1. existingSecret — created by External Secrets or sealed-secrets.
+#      This is what production should use.
+#   2. create: true with values — convenient for dev; the values land in the
+#      release's stored manifest, so never use it for a real credential.
+#   3. Neither — no secret is mounted (fine when JWKS is used and Redis has no
+#      AUTH token).
+secrets:
+  existingSecret: ""
+  create: false
+  # Only read when create is true.
+  data:
+    BFF_REDIS_PASSWORD: ""
+    BFF_JWT_HS256_SECRET: ""
+
+# ---------------------------------------------------------------------------
+# Redis (L2 cache)
+# ---------------------------------------------------------------------------
+# `redis.enabled` is the condition on the Bitnami dependency in Chart.yaml.
+# When false, Helm skips the subchart entirely and the BFF is pointed at
+# `externalRedis` instead — which is how production reaches ElastiCache.
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: false
+  master:
+    persistence:
+      # This is a cache. Persisting it buys nothing and costs a PVC.
+      enabled: false
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+    configuration: |-
+      maxmemory-policy allkeys-lru
+      save ""
+      appendonly no
+
+# Used when redis.enabled is false. Leave `host` empty to fall back to
+# config.cache.redis.addr as written in the config block below.
+externalRedis:
+  host: ""
+  port: 6379
+  # NAME of the env var holding the AUTH token; the value comes from
+  # secrets.existingSecret.
+  passwordEnv: BFF_REDIS_PASSWORD
+  # True when the endpoint has transit encryption enabled (every ElastiCache
+  # replication group this stack creates does). The chart reports it in NOTES
+  # so an operator can see at a glance that the connection must be TLS; it is
+  # not turned into an extra config key, because cache.redis in
+  # docs/DESIGN-CONTRACT.md section 6 has a fixed key set.
+  tls: false
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry
+# ---------------------------------------------------------------------------
+otel:
+  enabled: true
+  # OTLP/gRPC endpoint. In-cluster ADOT or OTel collector.
+  endpoint: otel-collector.observability.svc.cluster.local:4317
+  insecure: true
+  timeout: 5s
+  protocol: grpc
+  # Head sampling ratio. The collector's tail sampler keeps all errors and slow
+  # traces regardless, so this can be low without losing the interesting ones.
+  traceSampleRatio: 0.1
+  metricsInterval: 15s
+  serviceName: ttl-aware-bff
+  environment: production
+  # Appended to the standard service.namespace / deployment.environment pair.
+  resourceAttributes: {}
+  propagators: "tracecontext,baggage"
+  log:
+    level: info
+    format: json
+
+# ---------------------------------------------------------------------------
+# Routing TTL overrides
+# ---------------------------------------------------------------------------
+# Deep-merged over config.routing below, so a values file can retune freshness
+# without restating the whole routing block. Rule ids and semantics are in
+# docs/DESIGN-CONTRACT.md §5.
+#
+#   ttl        how long the operational source's data counts as FRESH
+#   cache_ttl  how long a rendered response may be served from cache
+#   max_stale  how far past ttl a value may still be served, degraded
+#
+# Example:
+#   routingOverrides:
+#     request_types:
+#       resource_status:
+#         ttl: 5s
+#         max_stale: 30s
+routingOverrides: {}
+
+# ---------------------------------------------------------------------------
+# Tenant overrides
+# ---------------------------------------------------------------------------
+# Deep-merged over config.tenants. Each key is a tenant id as it appears in the
+# JWT `tid` claim; the value may override any routing/cache/security subtree.
+#
+# Example:
+#   tenantOverrides:
+#     acme:
+#       routing:
+#         request_types:
+#           resource_status:
+#             ttl: 5s
+#       security:
+#         rate_limit:
+#           rps: 500
+tenantOverrides: {}
+
+# ---------------------------------------------------------------------------
+# Extra environment variables
+# ---------------------------------------------------------------------------
+# Appended after everything the chart generates, so these win on a duplicate
+# name (Kubernetes keeps the last entry). Use the BFF_ prefix with `__` nesting
+# to override any config key without editing the config block.
+#
+#   extraEnv:
+#     - name: BFF_SOURCES__OPERATIONAL__CALL_TIMEOUT
+#       value: "1200ms"
+#     - name: BFF_ROUTING__DEFAULTS__ALLOW_STALE
+#       value: "false"
+extraEnv: []
+
+# envFrom sources appended to the container (ConfigMaps or Secrets).
+#   extraEnvFrom:
+#     - secretRef:
+#         name: extra-credentials
+extraEnvFrom: []
+
+# Extra volumes/mounts, e.g. a CA bundle for a TLS-enabled upstream.
+extraVolumes: []
+extraVolumeMounts: []
+
+# ---------------------------------------------------------------------------
+# Application configuration -> rendered verbatim as /etc/bff/bff.yaml
+# ---------------------------------------------------------------------------
+# Key layout is fixed by docs/DESIGN-CONTRACT.md §6. Two rules:
+#   1. No TTL is ever compiled into Go source (REQ-CFG-001) — every duration
+#      the router reasons about lives here.
+#   2. No secret value lives here — only the NAME of the env var holding one.
+#
+# The chart overwrites a handful of these from the higher-level values above
+# (observability.* from `otel`, cache.redis.addr from `redis`/`externalRedis`)
+# so those settings have exactly one home.
+config:
+  server:
+    http_addr: ":8080"
+    admin_addr: ":9090"
+    read_timeout: 5s
+    write_timeout: 10s
+    idle_timeout: 60s
+    # Must be < terminationGracePeriodSeconds - preStopSleepSeconds.
+    shutdown_grace: 25s
+    max_body_bytes: 1048576
+
+  security:
+    jwt:
+      issuer: "https://auth.example.com/"
+      audience: "ttl-aware-bff"
+      # Asymmetric verification is the production path; when jwks_url is set the
+      # HS256 secret is ignored.
+      jwks_url: "https://auth.example.com/.well-known/jwks.json"
+      hs256_secret_env: "BFF_JWT_HS256_SECRET"
+      leeway: 30s
+      required_claims: ["sub", "tid"]
+    rbac:
+      roles:
+        resource.read: ["resource_read", "resource_status", "resource_configuration", "resource_details"]
+        execution.read: ["execution_status", "execution_history"]
+        bff.admin: ["resource_read", "resource_status", "resource_configuration", "resource_details", "execution_status", "execution_history"]
+    rate_limit:
+      rps: 200
+      burst: 400
+      # Per-tenant buckets stop one noisy tenant starving the rest.
+      per_tenant: true
+
+  sources:
+    # Operational Data Source — gRPC, authoritative for current state.
+    operational:
+      addr: "ttl-aware-bff-opsource.bff.svc.cluster.local:9101"
+      dial_timeout: 2s
+      call_timeout: 800ms
+      # On the critical path of every routing decision, hence the tight budget.
+      freshness_probe_timeout: 250ms
+      max_conns: 8
+      keepalive: 30s
+      tls:
+        enabled: false
+        insecure_skip_verify: false
+        ca_file: ""
+        server_name: ""
+      retry:
+        # One retry. Retrying a slow upstream turns a brownout into an outage.
+        max_attempts: 2
+        base_backoff: 20ms
+        max_backoff: 200ms
+        jitter: 0.2
+      breaker:
+        failure_threshold: 0.5
+        minimum_requests: 20
+        open_duration: 10s
+        half_open_max_calls: 5
+        rolling_window: 30s
+      bulkhead:
+        max_concurrent: 64
+        acquire_timeout: 50ms
+
+    # Execution Data Source — REST, authoritative for execution history.
+    execution:
+      base_url: "http://ttl-aware-bff-exsource.bff.svc.cluster.local:9102"
+      call_timeout: 1500ms
+      freshness_probe_timeout: 250ms
+      max_conns: 32
+      keepalive: 30s
+      tls:
+        enabled: false
+        insecure_skip_verify: false
+        ca_file: ""
+        server_name: ""
+      retry:
+        max_attempts: 2
+        base_backoff: 25ms
+        max_backoff: 250ms
+        jitter: 0.2
+      breaker:
+        failure_threshold: 0.5
+        minimum_requests: 20
+        open_duration: 15s
+        half_open_max_calls: 5
+        rolling_window: 30s
+      bulkhead:
+        max_concurrent: 32
+        acquire_timeout: 50ms
+
+  cache:
+    enabled: true
+    backend: redis
+    redis:
+      # Overwritten by the chart from `redis` / `externalRedis`.
+      addr: "ttl-aware-bff-redis:6379"
+      db: 0
+      password_env: "BFF_REDIS_PASSWORD"
+      pool_size: 64
+      dial_timeout: 500ms
+    l1:
+      enabled: true
+      max_entries: 10000
+      # Shorter than any routing TTL on purpose: L1 absorbs bursts, it never
+      # decides whether data is fresh.
+      ttl: 2s
+    # Part of the key, so a schema change is a prefix bump rather than a flush.
+    key_prefix: "bff:v1"
+    negative_ttl: 5s
+    stampede:
+      enabled: true
+      lock_ttl: 3s
+
+  routing:
+    defaults:
+      on_unknown_freshness: operational
+      clock_skew_tolerance: 2s
+      allow_stale: true
+      max_stale: 5m
+    request_types:
+      resource_status:
+        preferred_source: operational
+        ttl: 10s
+        cache_ttl: 3s
+        fallback: execution
+        allow_stale: true
+        max_stale: 120s
+      resource_configuration:
+        preferred_source: operational
+        ttl: 30s
+        cache_ttl: 15s
+        fallback: none
+        allow_stale: true
+        max_stale: 300s
+      resource_read:
+        preferred_source: operational
+        ttl: 30s
+        cache_ttl: 5s
+        fallback: execution
+        allow_stale: true
+        max_stale: 300s
+      execution_status:
+        preferred_source: execution
+        ttl: 5s
+        cache_ttl: 2s
+        fallback: none
+        allow_stale: false
+      execution_history:
+        # ttl 0 = never consider a cached copy fresh; always live.
+        preferred_source: execution
+        ttl: 0s
+        cache_ttl: 0s
+        fallback: none
+        allow_stale: false
+      resource_details:
+        preferred_source: both
+        ttl: 30s
+        cache_ttl: 5s
+        fallback: operational
+        allow_stale: true
+        max_stale: 300s
+        required_sources:
+          # execution optional: absence downgrades to partial, never fails.
+          operational: true
+          execution: false
+
+  precedence:
+    fields:
+      status: ["operational", "execution"]
+      configuration: ["operational"]
+      metrics: ["operational"]
+      topology: ["operational"]
+      owner: ["operational"]
+      latestExecution: ["execution"]
+      executionHistory: ["execution"]
+      lastOperation: ["execution"]
+    # While an execution is RUNNING the execution source is ahead of the
+    # operational source for these fields.
+    execution_overrides_when_running: ["status", "lifecycleState"]
+
+  # Base tenants; `tenantOverrides` above is deep-merged over this.
+  tenants: {}
+
+  observability:
+    service_name: "ttl-aware-bff"
+    # Overwritten by the chart with the resolved image tag.
+    service_version: ""
+    environment: "production"
+    otlp:
+      endpoint: "otel-collector.observability.svc.cluster.local:4317"
+      insecure: true
+      timeout: 5s
+    trace_sample_ratio: 0.1
+    metrics_interval: 15s
+    log:
+      level: info
+      format: json
+
+# ---------------------------------------------------------------------------
+# Helm test pod (`helm test <release>`)
+# ---------------------------------------------------------------------------
+tests:
+  enabled: true
+  image:
+    repository: curlimages/curl
+    tag: "8.11.1"
+    pullPolicy: IfNotPresent
+  # Removed automatically after a successful run; keep it for a failure by
+  # setting this to false.
+  deleteOnSuccess: true

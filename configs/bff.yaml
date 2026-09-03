@@ -1,0 +1,359 @@
+# TTL-aware BFF configuration.
+#
+# This file is the ONLY place a TTL, timeout, threshold or precedence rule is
+# allowed to have a value. Nothing under internal/ compiles one in.
+#
+# Two kinds of TTL appear below and they are NOT the same thing:
+#
+#   routing.request_types.<type>.ttl        SOURCE FRESHNESS TTL
+#       How old the operational source's copy of a record may be and still
+#       satisfy this kind of request. Drives the routing decision.
+#
+#   routing.request_types.<type>.cache_ttl  BFF RESPONSE CACHE TTL
+#       How long the BFF may reuse a computed answer. Drives nothing but the
+#       cache. Validation refuses a cache_ttl larger than the ttl, because that
+#       would let the cache serve data the freshness policy calls stale.
+#
+# Every value here can be overridden by an environment variable using the BFF_
+# prefix and "__" as the nesting separator, for example:
+#
+#   BFF_ROUTING__REQUEST_TYPES__RESOURCE_STATUS__TTL=5s
+#   BFF_SOURCES__OPERATIONAL__ADDR=ods.internal:9101
+#   BFF_CACHE__BACKEND=layered
+#
+# The file is re-read while the service runs (see --config-watch). A reload
+# that fails validation is rejected and the previous configuration stays in
+# force.
+
+server:
+  http_addr: ":8080"
+  admin_addr: ":9090"
+  read_timeout: 5s
+  header_timeout: 2s
+  write_timeout: 15s
+  idle_timeout: 60s
+  # Must exceed the slowest per-source budget below plus mapping time, and must
+  # be comfortably shorter than the ALB idle timeout.
+  request_timeout: 8s
+  # preStop sleep (10s) + this < terminationGracePeriodSeconds (45s).
+  shutdown_grace: 25s
+  max_body_bytes: 1048576
+
+security:
+  # Local development only. Config validation refuses this outside
+  # observability.environment: local|test.
+  allow_insecure_no_auth: true
+  jwt:
+    issuer: "https://issuer.example.invalid/"
+    audience: "ttl-aware-bff"
+    # Production sets jwks_url and leaves hs256_secret_env unset.
+    jwks_url: ""
+    jwks_ttl: 10m
+    hs256_secret_env: "BFF_JWT_HS256_SECRET"
+    leeway: 30s
+    tenant_claim: "tenant_id"
+    roles_claim: "roles"
+    required_claims: ["sub", "tenant_id"]
+  rbac:
+    default_deny: true
+    roles:
+      bff.viewer: ["resource.read", "execution.read"]
+      bff.operator: ["resource.read", "execution.read", "execution.audit.read"]
+      bff.admin: ["resource.read", "execution.read", "execution.audit.read", "config.read"]
+  rate_limit:
+    enabled: true
+    rps: 200
+    burst: 400
+    per_tenant: true
+    max_tenants: 10000
+
+sources:
+  # ---------------------------------------------------------------------------
+  # Operational Data Source: gRPC, low latency, current state.
+  # ---------------------------------------------------------------------------
+  operational:
+    addr: "localhost:9101"
+    dial_timeout: 2s
+    # The full-read budget. Deliberately tight: this source is supposed to be
+    # fast, and a slow answer from it is a signal, not something to wait out.
+    call_timeout: 400ms
+    # The freshness probe must be much cheaper than a read, or TTL routing
+    # costs more than it saves. Validation enforces probe < call_timeout.
+    freshness_probe_timeout: 120ms
+    keepalive_time: 30s
+    keepalive_timeout: 10s
+    max_recv_msg_bytes: 4194304
+    wait_for_ready: false
+    use_round_robin: true
+    accepted_schema_versions: ["ods.v1"]
+    retry:
+      enabled: true
+      max_attempts: 3
+      base_backoff: 20ms
+      max_backoff: 400ms
+      jitter_fraction: 1.0
+      budget_ratio: 0.6
+    breaker:
+      enabled: true
+      failure_threshold: 0.5
+      minimum_requests: 20
+      window: 30s
+      open_timeout: 5s
+      half_open_max_calls: 3
+      half_open_successes: 2
+    bulkhead:
+      enabled: true
+      max_concurrent: 256
+      acquire_timeout: 50ms
+      max_queue: 512
+    tls:
+      enabled: false
+
+  # ---------------------------------------------------------------------------
+  # Execution Data Source: REST, higher latency, workflow and history.
+  # ---------------------------------------------------------------------------
+  execution:
+    base_url: "http://localhost:9102"
+    # Five times the operational budget, because this source genuinely is
+    # slower. The bulkhead below is what stops that from mattering to the BFF.
+    call_timeout: 2s
+    max_idle_conns: 128
+    max_idle_conns_per_host: 64
+    idle_conn_timeout: 90s
+    history_page_size: 25
+    max_history_items: 200
+    accepted_schema_versions: ["eds.v1"]
+    retry:
+      enabled: true
+      # Fewer attempts than the operational source: each one is expensive, and
+      # a second failure here rarely turns into a third success.
+      max_attempts: 2
+      base_backoff: 50ms
+      max_backoff: 500ms
+      jitter_fraction: 1.0
+      budget_ratio: 0.5
+    breaker:
+      enabled: true
+      failure_threshold: 0.5
+      minimum_requests: 20
+      window: 30s
+      open_timeout: 5s
+      half_open_max_calls: 3
+      half_open_successes: 2
+    bulkhead:
+      # A quarter of the operational allowance. This is the number that keeps a
+      # slow execution source from consuming every goroutine in the BFF.
+      enabled: true
+      max_concurrent: 64
+      acquire_timeout: 100ms
+      max_queue: 128
+    tls:
+      enabled: false
+
+cache:
+  enabled: true
+  # memory for a single instance, layered (L1 + Redis) in production.
+  backend: "memory"
+  key_prefix: "bff:v1"
+  # How long a "not found" is remembered, so a UI polling a missing resource
+  # does not hammer both sources.
+  negative_ttl: 3s
+  # How long an entry is physically retained past its cache TTL so it remains
+  # available to the stale-serve degradation path.
+  stale_grace: 5m
+  # A cache failure must never fail a request.
+  fail_open: true
+  l1:
+    enabled: true
+    max_entries: 20000
+    ttl: 2s
+  redis:
+    addr: "localhost:6379"
+    db: 0
+    password_env: "BFF_REDIS_PASSWORD"
+    pool_size: 64
+    min_idle_conns: 8
+    dial_timeout: 500ms
+    read_timeout: 200ms
+    write_timeout: 200ms
+    tls:
+      enabled: false
+  stampede:
+    enabled: true
+    lock_ttl: 2s
+    # Refresh in the background once an entry is 80% through its life, so the
+    # expiry cliff does not land on a user's request.
+    early_refresh_ratio: 0.8
+
+routing:
+  defaults:
+    # What to do when freshness cannot be established at all.
+    on_unknown_freshness: "operational"
+    clock_skew_tolerance: 2s
+    allow_stale: true
+    max_stale: 5m
+    probe_enabled: true
+    # How often the BFF may re-ask "how old is this?". A cache TTL, not a
+    # freshness TTL: a reused probe result still ages.
+    probe_cache_ttl: 1s
+    # When an operational record says a workflow is mutating the resource,
+    # consult the execution source even on an operational-only read, so that
+    # /status and /details cannot disagree mid-workflow. Costs one extra call,
+    # only in the in-flight case, and is best-effort.
+    resolve_in_flight_execution: true
+    in_flight_lookup_timeout: 300ms
+
+  request_types:
+    # Current state, polled by the UI. Tight TTL, falls back to the execution
+    # source when the operational copy has aged out.
+    resource_status:
+      preferred_source: operational
+      ttl: 10s
+      cache_ttl: 3s
+      fallback: execution
+      allow_stale: true
+      max_stale: 120s
+      consistency: bounded
+      max_latency: 300ms
+
+    # Configuration changes rarely, so it tolerates a longer TTL and has no
+    # meaningful fallback: the execution source does not hold configuration.
+    resource_configuration:
+      preferred_source: operational
+      ttl: 30s
+      cache_ttl: 15s
+      fallback: none
+      allow_stale: true
+      max_stale: 300s
+      consistency: eventual
+      max_latency: 400ms
+
+    resource_read:
+      preferred_source: operational
+      ttl: 30s
+      cache_ttl: 5s
+      fallback: execution
+      allow_stale: true
+      max_stale: 300s
+      consistency: bounded
+      max_latency: 500ms
+
+    # A running workflow's state must be read live: showing a user a stale
+    # "in progress" for an execution that finished is the failure mode this
+    # endpoint exists to avoid.
+    execution_status:
+      preferred_source: execution
+      ttl: 5s
+      cache_ttl: 2s
+      fallback: none
+      allow_stale: false
+      consistency: strong
+      max_latency: 2s
+
+    # ttl 0 and cache_ttl 0: history is always read live.
+    execution_history:
+      preferred_source: execution
+      ttl: 0s
+      cache_ttl: 0s
+      fallback: none
+      allow_stale: false
+      consistency: strong
+      max_latency: 3s
+
+    # The both-source fan-out. The operational side is required; the execution
+    # side is optional, so a slow or failing EDS yields a partial response
+    # rather than an error.
+    resource_details:
+      preferred_source: both
+      ttl: 30s
+      cache_ttl: 5s
+      fallback: operational
+      allow_stale: true
+      max_stale: 300s
+      consistency: bounded
+      max_latency: 2s
+      required_sources:
+        operational: true
+        execution: false
+      per_source_timeout:
+        operational: 400ms
+        execution: 1500ms
+
+precedence:
+  # Ordered, most authoritative first. A field listed with a single source is
+  # what lets the router prove a request needs only that source.
+  fields:
+    status: ["operational", "execution"]
+    subState: ["operational"]
+    type: ["operational"]
+    configuration: ["operational"]
+    metrics: ["operational"]
+    topology: ["operational"]
+    owner: ["operational"]
+    labels: ["operational"]
+    customerId: ["operational", "execution"]
+    latestExecution: ["execution"]
+    executionHistory: ["execution"]
+    executionStatus: ["execution"]
+    workflowSteps: ["execution"]
+    audit: ["execution"]
+    lastOperation: ["execution"]
+  # While a workflow is mutating the resource, the execution source's view of
+  # these fields outranks the operational source's. This is the ONLY way
+  # execution data can override operational data, and it is explicit.
+  execution_overrides_when_running: ["status", "subState"]
+  conflict_warning: true
+
+# Per-tenant overrides. Anything omitted falls through to the values above.
+tenants:
+  acme:
+    routing:
+      request_types:
+        # A tenant with a faster-refreshing operational source can afford a
+        # tighter TTL without changing anything else.
+        resource_status:
+          ttl: 5s
+          cache_ttl: 2s
+          max_stale: 60s
+          allow_stale: true
+    security:
+      rate_limit:
+        enabled: true
+        rps: 500
+        burst: 1000
+        per_tenant: true
+        max_tenants: 10000
+  globex:
+    routing:
+      request_types:
+        # A tenant that prefers correctness over latency: no stale answers.
+        resource_status:
+          ttl: 15s
+          cache_ttl: 5s
+          max_stale: 15s
+          allow_stale: false
+
+observability:
+  service_name: "ttl-aware-bff"
+  service_version: "dev"
+  environment: "local"
+  trace_sample_ratio: 1.0
+  metrics_interval: 15s
+  prometheus_endpoint: true
+  otlp:
+    enabled: false
+    endpoint: "localhost:4317"
+    insecure: true
+    timeout: 5s
+  log:
+    level: "info"
+    format: "json"
+    add_source: false
+    redact_keys:
+      - authorization
+      - password
+      - token
+      - secret
+      - cookie
+      - set-cookie
+      - api_key

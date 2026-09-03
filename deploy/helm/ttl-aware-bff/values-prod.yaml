@@ -1,0 +1,179 @@
+# Production values.
+#
+#   helm upgrade --install bff deploy/helm/ttl-aware-bff \
+#     -n bff --create-namespace \
+#     -f deploy/helm/ttl-aware-bff/values-prod.yaml \
+#     --set image.digest=sha256:<digest from the release build> \
+#     --atomic --timeout 10m
+#
+# `--atomic` matters: a failed upgrade rolls back rather than leaving the
+# release half-applied.
+#
+# The account ids, ARNs and endpoints below are the documented placeholders.
+# Replace them with the corresponding Terraform outputs:
+#   bff_irsa_role_arn, acm_certificate_arn, waf_web_acl_arn,
+#   elasticache_primary_endpoint, alb_access_logs_bucket.
+
+fullnameOverride: ttl-aware-bff
+
+image:
+  # Pin a digest in production. The tag is kept for readability; when digest is
+  # set the chart uses repository@digest and ignores the tag.
+  tag: "1.0.0"
+  digest: ""
+  pullPolicy: IfNotPresent
+
+autoscaling:
+  enabled: true
+  minReplicas: 6
+  maxReplicas: 60
+  targetCPUUtilizationPercentage: 65
+  customMetric:
+    enabled: true
+    name: bff_concurrent_requests
+    averageValue: "40"
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+    ephemeral-storage: 128Mi
+  limits:
+    memory: 2Gi
+    ephemeral-storage: 512Mi
+goMemLimit: "1600MiB"
+
+# With >= 6 replicas a percentage budget drains a node far faster than
+# one-pod-at-a-time while still protecting a quorum.
+pdb:
+  enabled: true
+  maxUnavailable: 25%
+
+# Production runs across at least three nodes, so co-locating two replicas is a
+# real availability risk rather than a scheduling inconvenience: the base
+# chart's preference becomes a requirement here.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/os
+              operator: In
+              values: ["linux"]
+            - key: kubernetes.io/arch
+              operator: In
+              values: ["amd64", "arm64"]
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - topologyKey: kubernetes.io/hostname
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: ttl-aware-bff
+
+serviceAccount:
+  roleArn: "arn:aws:iam::222222222222:role/ttl-aware-bff-irsa-prod"
+
+# --- Cache: ElastiCache, not an in-cluster Redis ---------------------------
+redis:
+  enabled: false
+
+externalRedis:
+  # Terraform output `elasticache_primary_endpoint`.
+  host: master.ttl-aware-bff-prod.abcdef.use1.cache.amazonaws.com
+  port: 6379
+  passwordEnv: BFF_REDIS_PASSWORD
+  # The replication group has transit_encryption_enabled = true.
+  tls: true
+
+# The AUTH token and JWT secret are reconciled from AWS Secrets Manager by
+# External Secrets into this Secret. See deploy/k8s/secret.example.yaml.
+secrets:
+  existingSecret: ttl-aware-bff-secrets
+  create: false
+
+otel:
+  enabled: true
+  endpoint: adot-collector.observability.svc.cluster.local:4317
+  insecure: true
+  environment: production
+  # 5% head sampling. The collector's tail policy keeps every error and every
+  # slow trace, so the interesting ones are never the ones dropped.
+  traceSampleRatio: 0.05
+  metricsInterval: 15s
+  log:
+    level: info
+    format: json
+  resourceAttributes:
+    cluster: prod-use1
+    region: us-east-1
+
+# Production keeps the contract's default TTLs; overriding them here is what
+# this block is for when a tenant-wide retune is needed.
+routingOverrides: {}
+
+tenantOverrides:
+  acme:
+    routing:
+      request_types:
+        resource_status:
+          ttl: 5s
+          max_stale: 30s
+    cache:
+      l1:
+        ttl: 1s
+    security:
+      rate_limit:
+        rps: 500
+        burst: 1000
+
+ingress:
+  enabled: true
+  host: bff.example.com
+  tls:
+    enabled: true
+    secretName: ttl-aware-bff-tls
+  alb:
+    scheme: internet-facing
+    targetType: ip
+    groupName: bff-public
+    loadBalancerName: ttl-aware-bff-alb
+    certificateArn: "arn:aws:acm:us-east-1:222222222222:certificate/22222222-2222-2222-2222-222222222222"
+    sslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    wafAclArn: "arn:aws:wafv2:us-east-1:222222222222:regional/webacl/ttl-aware-bff-waf/22222222-2222-2222-2222-222222222222"
+    shieldAdvanced: true
+    accessLogsBucket: ttl-aware-bff-alb-logs
+    deregistrationDelaySeconds: 60
+    idleTimeoutSeconds: 60
+
+networkPolicy:
+  enabled: true
+  denyAll: true
+  # Terraform output `vpc_cidr`.
+  clusterCidr: 10.0.0.0/16
+  monitoringNamespaces:
+    - observability
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack
+  interval: 15s
+
+extraEnv:
+  # A larger pool than the default: 60 replicas at peak share one ElastiCache
+  # primary, and connection churn there is expensive.
+  - name: BFF_CACHE__REDIS__POOL_SIZE
+    value: "128"
+  # The replication group is created with transit encryption enabled, so the
+  # client MUST negotiate TLS. That is signalled by externalRedis.tls above
+  # rather than by an ad-hoc environment variable, because cache.redis in
+  # docs/DESIGN-CONTRACT.md section 6 has a fixed key set and inventing one
+  # here would put the manifest and the contract out of step.
+
+config:
+  security:
+    rate_limit:
+      rps: 500
+      burst: 1000
+  observability:
+    environment: production

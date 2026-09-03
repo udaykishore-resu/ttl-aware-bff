@@ -1,0 +1,58 @@
+# Kustomize base for the TTL-aware BFF.
+#
+#   kubectl kustomize deploy/k8s                     # render the base
+#   kubectl kustomize deploy/k8s/overlays/dev        # render the dev overlay
+#   kubectl apply -k deploy/k8s/overlays/prod        # apply production
+#
+# The base is intentionally production-shaped (3 replicas, restricted security
+# context, real resource requests). Overlays relax it for dev rather than
+# hardening it for prod, so a forgotten overlay fails safe.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: bff
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - ingress.yaml
+  - servicemonitor.yaml
+  # secret.example.yaml is deliberately NOT listed. It documents the secret's
+  # shape; the real Secret arrives from External Secrets or sealed-secrets and
+  # must not be applied from the repository. See secret.example.yaml.
+
+# Applied to every resource and to the Deployment's pod template.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: ttl-aware-bff
+      app.kubernetes.io/managed-by: kustomize
+
+commonAnnotations:
+  bff.internal/contract: "docs/DESIGN-CONTRACT.md"
+
+# Image tags are the only thing CI rewrites, via:
+#   kustomize edit set image ghcr.io/udaykishore/ttl-aware-bff=...:<sha>
+images:
+  - name: ghcr.io/udaykishore/ttl-aware-bff
+    newName: ghcr.io/udaykishore/ttl-aware-bff
+    newTag: "0.0.0"
+
+# The HPA owns spec.replicas at runtime. Declaring it here as well would make
+# every `apply` reset the replica count to the base value and undo a scale-up,
+# so the field is dropped from the rendered Deployment and left to the HPA.
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: ttl-aware-bff
+    patch: |-
+      - op: remove
+        path: /spec/replicas

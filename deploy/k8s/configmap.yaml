@@ -1,0 +1,283 @@
+# ConfigMap carrying the full bff.yaml, mounted at /etc/bff/bff.yaml and passed
+# to the binary with `--config`.
+#
+# The key layout is fixed by docs/DESIGN-CONTRACT.md §6. Two rules govern what
+# belongs here:
+#
+#   1. No TTL is ever compiled into Go source (REQ-CFG-001). Every duration the
+#      router reasons about lives in this file.
+#   2. No secret value lives here. Config carries only the NAME of the env var
+#      holding a credential (`*_env` keys); the value comes from
+#      ttl-aware-bff-secrets. See secret.example.yaml.
+#
+# Anything in this file can be overridden per-pod with a `BFF_`-prefixed
+# environment variable using `__` as the nesting separator, e.g.
+# BFF_ROUTING__REQUEST_TYPES__RESOURCE_STATUS__TTL=5s.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ttl-aware-bff-config
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/component: bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+data:
+  bff.yaml: |
+    # ---------------------------------------------------------------------
+    # HTTP servers
+    # ---------------------------------------------------------------------
+    server:
+      # Public API. Ports are fixed by the design contract; changing them here
+      # requires changing the Service, the probes and the NetworkPolicy too.
+      http_addr: ":8080"
+      # Admin: /healthz, /readyz, /livez, /metrics. Never exposed by the Ingress.
+      admin_addr: ":9090"
+      read_timeout: 5s
+      write_timeout: 10s
+      idle_timeout: 60s
+      # Time allowed to drain in-flight requests after SIGTERM. Must be smaller
+      # than the pod's terminationGracePeriodSeconds minus the preStop sleep;
+      # see the arithmetic in deployment.yaml.
+      shutdown_grace: 25s
+      max_body_bytes: 1048576
+
+    # ---------------------------------------------------------------------
+    # Authentication, authorisation, rate limiting
+    # ---------------------------------------------------------------------
+    security:
+      jwt:
+        issuer: "https://auth.example.com/"
+        audience: "ttl-aware-bff"
+        # Asymmetric verification is the production path. When jwks_url is set
+        # the HS256 secret below is ignored.
+        jwks_url: "https://auth.example.com/.well-known/jwks.json"
+        # NAME of the env var holding the symmetric key, not the key.
+        hs256_secret_env: "BFF_JWT_HS256_SECRET"
+        # Tolerance for clock drift between the issuer and this pod.
+        leeway: 30s
+        required_claims: ["sub", "tid"]
+      rbac:
+        # role -> request types the role may execute. Request-type names are the
+        # classifier's output (design contract §3).
+        roles:
+          resource.read: ["resource_read", "resource_status", "resource_configuration", "resource_details"]
+          execution.read: ["execution_status", "execution_history"]
+          bff.admin: ["resource_read", "resource_status", "resource_configuration", "resource_details", "execution_status", "execution_history"]
+      rate_limit:
+        rps: 200
+        burst: 400
+        # Buckets keyed by tenant rather than globally, so one noisy tenant
+        # cannot starve the others.
+        per_tenant: true
+
+    # ---------------------------------------------------------------------
+    # Upstream data sources
+    # ---------------------------------------------------------------------
+    sources:
+      # Operational Data Source — gRPC, authoritative for current state.
+      operational:
+        addr: "ttl-aware-bff-opsource.bff.svc.cluster.local:9101"
+        dial_timeout: 2s
+        call_timeout: 800ms
+        # The freshness probe is on the critical path of every routing
+        # decision, so it gets a much tighter budget than a full call.
+        freshness_probe_timeout: 250ms
+        max_conns: 8
+        keepalive: 30s
+        tls:
+          enabled: false
+          insecure_skip_verify: false
+          ca_file: ""
+          server_name: ""
+        retry:
+          # Bounded: 1 retry. Retrying a slow upstream is how a brownout
+          # becomes an outage.
+          max_attempts: 2
+          base_backoff: 20ms
+          max_backoff: 200ms
+          jitter: 0.2
+        breaker:
+          failure_threshold: 0.5
+          minimum_requests: 20
+          open_duration: 10s
+          half_open_max_calls: 5
+          rolling_window: 30s
+        bulkhead:
+          max_concurrent: 64
+          acquire_timeout: 50ms
+
+      # Execution Data Source — REST, authoritative for execution history.
+      execution:
+        base_url: "http://ttl-aware-bff-exsource.bff.svc.cluster.local:9102"
+        call_timeout: 1500ms
+        freshness_probe_timeout: 250ms
+        max_conns: 32
+        keepalive: 30s
+        tls:
+          enabled: false
+          insecure_skip_verify: false
+          ca_file: ""
+          server_name: ""
+        retry:
+          max_attempts: 2
+          base_backoff: 25ms
+          max_backoff: 250ms
+          jitter: 0.2
+        breaker:
+          failure_threshold: 0.5
+          minimum_requests: 20
+          open_duration: 15s
+          half_open_max_calls: 5
+          rolling_window: 30s
+        bulkhead:
+          max_concurrent: 32
+          acquire_timeout: 50ms
+
+    # ---------------------------------------------------------------------
+    # Cache: L1 in-process + L2 Redis, cache-aside with singleflight
+    # ---------------------------------------------------------------------
+    cache:
+      enabled: true
+      backend: redis
+      redis:
+        # ElastiCache primary endpoint; overridden per environment with
+        # BFF_CACHE__REDIS__ADDR.
+        addr: "ttl-aware-bff-redis.bff.svc.cluster.local:6379"
+        db: 0
+        # NAME of the env var holding the AUTH token, not the token.
+        password_env: "BFF_REDIS_PASSWORD"
+        pool_size: 64
+        dial_timeout: 500ms
+      l1:
+        enabled: true
+        max_entries: 10000
+        # L1 TTL is deliberately shorter than any routing TTL: it absorbs
+        # request bursts without ever being the reason a value looks fresh.
+        ttl: 2s
+      # Prefix is part of the key so a schema change can be rolled out by
+      # bumping it rather than flushing the cluster.
+      key_prefix: "bff:v1"
+      # Negative caching stops a burst of 404s from becoming upstream load.
+      negative_ttl: 5s
+      stampede:
+        enabled: true
+        lock_ttl: 3s
+
+    # ---------------------------------------------------------------------
+    # Routing — the heart of the service. Rule ids in design contract §5.
+    # ---------------------------------------------------------------------
+    routing:
+      defaults:
+        # What to do when the operational source cannot tell us how fresh it is.
+        on_unknown_freshness: operational
+        # Absorbs disagreement between our clock and the source's observedAt.
+        clock_skew_tolerance: 2s
+        allow_stale: true
+        max_stale: 5m
+      request_types:
+        resource_status:
+          preferred_source: operational
+          ttl: 10s
+          cache_ttl: 3s
+          fallback: execution
+          allow_stale: true
+          max_stale: 120s
+        resource_configuration:
+          preferred_source: operational
+          ttl: 30s
+          cache_ttl: 15s
+          fallback: none
+          allow_stale: true
+          max_stale: 300s
+        resource_read:
+          preferred_source: operational
+          ttl: 30s
+          cache_ttl: 5s
+          fallback: execution
+          allow_stale: true
+          max_stale: 300s
+        execution_status:
+          preferred_source: execution
+          ttl: 5s
+          cache_ttl: 2s
+          fallback: none
+          allow_stale: false
+        execution_history:
+          # ttl 0 means "never consider a cached copy fresh": always live.
+          preferred_source: execution
+          ttl: 0s
+          cache_ttl: 0s
+          fallback: none
+          allow_stale: false
+        resource_details:
+          preferred_source: both
+          ttl: 30s
+          cache_ttl: 5s
+          fallback: operational
+          allow_stale: true
+          max_stale: 300s
+          required_sources:
+            # execution is optional: its absence downgrades the response to
+            # partial rather than failing it.
+            operational: true
+            execution: false
+
+    # ---------------------------------------------------------------------
+    # Field precedence — who wins when both sources answer
+    # ---------------------------------------------------------------------
+    precedence:
+      fields:
+        status: ["operational", "execution"]
+        configuration: ["operational"]
+        metrics: ["operational"]
+        topology: ["operational"]
+        owner: ["operational"]
+        latestExecution: ["execution"]
+        executionHistory: ["execution"]
+        lastOperation: ["execution"]
+      # While an execution is RUNNING the execution source is ahead of the
+      # operational source for these fields, so it wins despite the table above.
+      execution_overrides_when_running: ["status", "lifecycleState"]
+
+    # ---------------------------------------------------------------------
+    # Per-tenant overrides — deep-merged over everything above
+    # ---------------------------------------------------------------------
+    tenants:
+      acme:
+        routing:
+          request_types:
+            resource_status:
+              # acme's console polls hard and wants tighter freshness.
+              ttl: 5s
+              max_stale: 30s
+        cache:
+          l1:
+            ttl: 1s
+        security:
+          rate_limit:
+            rps: 500
+            burst: 1000
+
+    # ---------------------------------------------------------------------
+    # Observability
+    # ---------------------------------------------------------------------
+    observability:
+      service_name: "ttl-aware-bff"
+      # Overridden at deploy time with the image tag
+      # (BFF_OBSERVABILITY__SERVICE_VERSION).
+      service_version: "0.0.0"
+      environment: "production"
+      otlp:
+        # In-cluster ADOT/OTel collector, plaintext inside the mesh.
+        endpoint: "otel-collector.observability.svc.cluster.local:4317"
+        insecure: true
+        timeout: 5s
+      # Head sampling. Errors are always kept by the collector's tail policy.
+      trace_sample_ratio: 0.1
+      metrics_interval: 15s
+      log:
+        level: info
+        format: json

@@ -1,0 +1,27 @@
+%% C4 level 1 — system context for ttl-aware-bff.
+%% Source of truth: docs/DESIGN-CONTRACT.md §1, §3; cmd/bff, cmd/opsource, cmd/exsource.
+C4Context
+    title System context — TTL-Aware BFF
+
+    Person(operator, "Operations console user", "Watches resource state and workflow progress. Polls /status; opens /details on demand.")
+    Person_Ext(sre, "SRE / on-call", "Reads dashboards and the runbook; drives cache invalidation and config reloads.")
+
+    System_Boundary(bff_boundary, "Backend for Frontend") {
+        System(bff, "ttl-aware-bff", "Go service. Classifies a request, evaluates operational freshness against a per-request-type TTL, routes to one source or both, merges by precedence, and degrades on a fixed ladder. HTTP :8080, admin :9090.")
+    }
+
+    System_Ext(ods, "Operational Data Source (ODS)", "gRPC :9101. Current resource state. Cheap GetResourceFreshness probe plus GetResource / GetResourceState reads.")
+    System_Ext(eds, "Execution Data Source (EDS)", "REST :9102. Workflow executions, history and audit. Structurally slower; holds data the ODS cannot supply.")
+    System_Ext(cache, "Response cache", "In-process L1 and/or Redis L2. Holds the BFF's own computed answers, not source records.")
+    System_Ext(idp, "Identity provider", "Issues the JWT carrying sub, tenant_id and roles. JWKS or HS256.")
+    System_Ext(otel, "Telemetry backend", "OTLP collector, Prometheus scrape of :9090/metrics, trace storage.")
+
+    Rel(operator, bff, "GET /api/v1/resources/...", "HTTPS + JWT")
+    Rel(sre, bff, "GET :9090 /metrics, /config/routing, /readyz", "HTTP, cluster-internal")
+    Rel(bff, ods, "GetResourceFreshness, GetResourceState, GetResource", "gRPC")
+    Rel(bff, eds, "GET /eds/v1/executions, /latest-execution", "HTTPS/JSON")
+    Rel(bff, cache, "cache-aside GET/SET, stale read", "Redis protocol / in-process")
+    Rel(bff, idp, "Fetch JWKS", "HTTPS")
+    Rel(bff, otel, "Export spans and metrics", "OTLP/gRPC")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")

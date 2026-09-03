@@ -1,0 +1,119 @@
+# Example variable values.
+#
+#   cp terraform.tfvars.example terraform.tfvars   # then edit
+#
+# terraform.tfvars is gitignored (see /.gitignore) because it typically carries
+# account ids and zone ids that are not worth publishing. Nothing secret should
+# ever go in it — this stack takes no passwords as input; the ElastiCache AUTH
+# token is generated and stored in Secrets Manager by the elasticache module.
+
+# ---------------------------------------------------------------------------
+# Identity and placement
+# ---------------------------------------------------------------------------
+project     = "ttl-aware-bff"
+environment = "prod" # one of: dev, staging, prod
+region      = "us-east-1"
+
+# Role Terraform assumes for the apply. Leave empty to use ambient credentials.
+# assume_role_arn = "arn:aws:iam::222222222222:role/terraform-deploy"
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+# A /16. The VPC CNI gives every pod a real VPC address and pre-warms whole
+# ENIs, so pod IP exhaustion is the usual reason a cluster stops scheduling.
+vpc_cidr                = "10.0.0.0/16"
+availability_zone_count = 3
+
+# One NAT gateway instead of one per AZ saves roughly 65 USD/month per AZ but
+# makes that AZ a single point of failure for all egress. The root module
+# forces this to false when environment = "prod".
+single_nat_gateway = false
+
+enable_flow_logs = true
+
+# ---------------------------------------------------------------------------
+# EKS
+# ---------------------------------------------------------------------------
+# 1.30 is the floor: the Helm chart uses the native preStop `sleep` handler,
+# which does not exist before it, and a distroless image cannot run an exec hook.
+kubernetes_version = "1.31"
+
+node_instance_types     = ["m6i.large", "m6a.large", "m5.large"]
+node_group_min_size     = 3
+node_group_max_size     = 12
+node_group_desired_size = 3
+
+# Narrow this. The default (0.0.0.0/0) exposes the Kubernetes API to the entire
+# internet; it is only defensible while the CI runner has no VPC route.
+cluster_endpoint_public_access = true
+cluster_endpoint_public_access_cidrs = [
+  # "203.0.113.0/24",   # office egress
+  # "198.51.100.10/32", # CI runner NAT
+  "0.0.0.0/0",
+]
+
+# Roles granted cluster-admin through EKS access entries. Prefer a role that
+# people assume over a named IAM user.
+cluster_admin_principals = [
+  # "arn:aws:iam::222222222222:role/platform-engineering",
+]
+
+# ---------------------------------------------------------------------------
+# ElastiCache (the BFF's L2 cache)
+# ---------------------------------------------------------------------------
+# Size for the working set, not for durability: this is a cache, and a cold
+# cache costs upstream load, not data.
+redis_node_type      = "cache.t4g.medium"
+redis_engine_version = "7.1"
+
+# One replica in another AZ is what makes automatic failover possible. Zero
+# replicas means a primary failure is a full cache flush.
+redis_replica_count = 1
+
+# Zero is defensible for a pure cache and saves the snapshot storage cost.
+redis_snapshot_retention_days = 0
+
+# ---------------------------------------------------------------------------
+# ALB, DNS and TLS
+# ---------------------------------------------------------------------------
+domain_name = "bff.example.com"
+
+# Supply EITHER route53_zone_id (Terraform issues and DNS-validates an ACM
+# certificate) OR acm_certificate_arn (bring your own). Not both.
+route53_zone_id = "Z0123456789ABCDEFGHIJ"
+# acm_certificate_arn = "arn:aws:acm:us-east-1:222222222222:certificate/2222..."
+
+enable_waf = true
+# A blunt DDoS backstop. The precise control is the BFF's own per-tenant rate
+# limiter, which understands tenants; WAF only sees IPs, and a whole tenant may
+# sit behind one NAT address.
+waf_rate_limit_per_5min = 20000
+
+alb_access_logs_retention_days = 90
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+log_retention_days = 30
+enable_xray        = true
+
+# ---------------------------------------------------------------------------
+# Kubernetes identifiers — must match the manifests and the Helm chart
+# ---------------------------------------------------------------------------
+# Fixed by docs/DESIGN-CONTRACT.md section 9. The IRSA trust policy pins the
+# role to exactly this namespace/ServiceAccount pair, so a change here without
+# a matching change in the chart produces an AccessDenied with no explanation.
+k8s_namespace       = "bff"
+k8s_service_account = "ttl-aware-bff"
+
+# ---------------------------------------------------------------------------
+# Tagging
+# ---------------------------------------------------------------------------
+owner       = "platform-engineering"
+cost_center = "engineering"
+
+additional_tags = {
+  # DataClassification = "internal"
+  # Compliance         = "soc2"
+}

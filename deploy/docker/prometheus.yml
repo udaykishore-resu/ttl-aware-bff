@@ -1,0 +1,71 @@
+# Prometheus — local stack scrape configuration.
+#
+# Two independent metric paths exist, on purpose, so the local stack can prove
+# both work:
+#
+#   1. OTLP push:  bff --OTLP--> otel-collector --prometheus exporter :8889-->
+#                  scraped by the `otel-collector` job below.
+#   2. Direct pull: bff exposes /metrics on its admin port :9090 and is scraped
+#                  by the `bff-admin` job below.
+#
+# In the cluster only path 1 is used (ServiceMonitor scrapes the admin port
+# instead — see deploy/k8s/servicemonitor.yaml).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # Labels attached to every series and to anything sent to a remote write
+  # target; keeps local series distinguishable from a real environment's.
+  external_labels:
+    environment: local
+    stack: ttl-aware-bff
+
+# No Alertmanager in the local stack. Rule files would be listed here.
+rule_files: []
+
+scrape_configs:
+  # --- Prometheus itself ------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # --- Path 1: metrics that travelled BFF -> OTLP -> collector ---------------
+  # This is the job that carries the contract's instrument names
+  # (bff_request_total, operational_ttl_hit_total, execution_fallback_total,
+  # cache_hit_total, bff_request_latency, data_freshness_age,
+  # bff_concurrent_requests, ...) with resource attributes promoted to labels.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]
+        labels:
+          source: otlp
+
+  # --- Collector self-telemetry ----------------------------------------------
+  # Exposed through the same :8889 endpoint via the prometheus/internal
+  # receiver, so no extra target is needed; kept as a comment for clarity.
+
+  # --- Path 2: direct scrape of each service's admin port --------------------
+  # Ports per docs/DESIGN-CONTRACT.md §1.
+  - job_name: bff-admin
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["bff:9090"]
+        labels:
+          service: ttl-aware-bff
+          source: direct
+
+  - job_name: opsource-admin
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["opsource:9111"]
+        labels:
+          service: ttl-aware-bff-opsource
+          source: direct
+
+  - job_name: exsource-admin
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["exsource:9112"]
+        labels:
+          service: ttl-aware-bff-exsource
+          source: direct

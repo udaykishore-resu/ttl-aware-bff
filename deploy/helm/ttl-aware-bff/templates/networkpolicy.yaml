@@ -1,0 +1,171 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+NetworkPolicies.
+
+Requires an enforcing CNI (Calico, Cilium). The AWS VPC CNI enforces
+NetworkPolicy only with enableNetworkPolicy=true on the aws-node addon —
+without it these objects are accepted and silently ignored, which is the
+classic false sense of security. Verify enforcement before relying on this.
+
+Design: a namespace-wide default-deny, then an explicit allow-list. Egress is
+the interesting half — the BFF is the component that reaches out, and
+constraining it is what stops an SSRF-shaped bug becoming lateral movement.
+*/}}
+{{- if .Values.networkPolicy.denyAll }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "%s-default-deny" (include "ttl-aware-bff.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+spec:
+  # Empty selector = every pod in the namespace. No rules at all, so nothing is
+  # permitted except what the policies below add; NetworkPolicy is additive.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "%s-ingress" (include "ttl-aware-bff.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ttl-aware-bff.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # --- API traffic from the ALB --------------------------------------
+    # In `ip` target mode the traffic comes from the load balancer's ENIs,
+    # which are not pods, so no pod selector can match them. The cluster CIDR
+    # is used instead; narrow it to the private subnet CIDRs in production.
+    - from:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.clusterCidr }}
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # --- Same-namespace callers (integration tests, the Helm test pod) ---
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # --- Prometheus scraping the admin port -----------------------------
+    - from:
+        {{- range .Values.networkPolicy.monitoringNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 9090
+
+    # --- Kubelet probes --------------------------------------------------
+    # Probes originate from the node. Most CNIs exempt node-to-pod probe
+    # traffic; Calico does not by default, hence this rule.
+    - from:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.clusterCidr }}
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "%s-egress" (include "ttl-aware-bff.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ttl-aware-bff.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # --- DNS -------------------------------------------------------------
+    # Without this every other rule is dead: the upstreams are addressed by
+    # Service DNS name. TCP as well as UDP, because a large answer falls back.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dns.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dns.podSelectorLabels | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # --- Redis / ElastiCache (L2 cache) ---------------------------------
+    {{- if .Values.redis.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    {{- else }}
+    # ElastiCache is in the VPC, outside the pod CIDR, so it is reached by
+    # CIDR rather than by selector.
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.clusterCidr }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.externalRedis.port }}
+    {{- end }}
+
+    # --- Operational Data Source (ODS), gRPC :9101 ----------------------
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ttl-aware-bff-opsource
+      ports:
+        - protocol: TCP
+          port: 9101
+
+    # --- Execution Data Source (EDS), REST :9102 ------------------------
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ttl-aware-bff-exsource
+      ports:
+        - protocol: TCP
+          port: 9102
+
+    {{- if .Values.otel.enabled }}
+    # --- OpenTelemetry collector, OTLP/gRPC :4317 -----------------------
+    - to:
+        {{- range .Values.networkPolicy.monitoringNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 4317
+    {{- end }}
+
+    {{- with .Values.networkPolicy.extraEgress }}
+    # --- extraEgress ------------------------------------------------------
+    # Use this for an internet-hosted JWKS endpoint (a narrow HTTPS rule to the
+    # issuer) rather than opening 0.0.0.0/0, which would defeat the policy.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

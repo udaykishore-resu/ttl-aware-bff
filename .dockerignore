@@ -1,0 +1,75 @@
+# .dockerignore — keeps the build context small and, more importantly, keeps
+# churn out of the layers that matter.
+#
+# The Dockerfiles under deploy/docker copy `go.mod go.sum` first and then `.`.
+# Anything listed here can be edited without invalidating the `COPY . .` layer,
+# so a manifest or docs change never triggers a Go recompile.
+#
+# Note what is NOT ignored: `configs/` must stay in the context because
+# Dockerfile.bff bakes configs/bff.yaml into the image as /etc/bff/bff.yaml,
+# and `api/proto/` stays so the tree matches what generate produced.
+
+# --- VCS --------------------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- Build output -----------------------------------------------------------
+bin/
+dist/
+out/
+*.exe
+*.test
+*.out
+
+# --- Test / coverage artefacts ---------------------------------------------
+coverage.out
+coverage.html
+coverage.txt
+*.cover
+.testcache/
+
+# --- Deployment and infrastructure (never needed inside an image) -----------
+deploy/k8s
+deploy/helm
+deploy/terraform
+deploy/docker
+docker-compose.yaml
+docker-compose.override.yaml
+
+# --- Terraform local state --------------------------------------------------
+**/.terraform
+**/.terraform.lock.hcl
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/*.tfvars
+!**/*.tfvars.example
+
+# --- Documentation and specs ------------------------------------------------
+docs/
+spec/
+*.md
+
+# --- Load tests (k6 scripts run outside the image) --------------------------
+test/load
+
+# --- Vendored third-party sources used only by the offline build path -------
+third_party/
+
+# --- Local environment ------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Editors and OS cruft ---------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Tooling caches ---------------------------------------------------------
+.golangci-cache/
+tmp/

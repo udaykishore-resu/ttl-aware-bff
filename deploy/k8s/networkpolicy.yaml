@@ -1,0 +1,192 @@
+# NetworkPolicies for the BFF.
+#
+# Requires a CNI that enforces them (Calico, Cilium). The AWS VPC CNI enforces
+# NetworkPolicy only with `enableNetworkPolicy=true` on the aws-node addon —
+# without it these objects are accepted and silently ignored, which is the
+# classic false sense of security. Verify enforcement before relying on this.
+#
+# Design: default-deny both directions in the namespace, then allow exactly the
+# flows the BFF needs. Egress is the interesting half — the BFF is the thing
+# that reaches out, and constraining it is what stops an SSRF-shaped bug from
+# becoming lateral movement.
+#
+# Allowed egress: DNS, Redis (6379), the operational source (9101), the
+# execution source (9102), the OTel collector (4317). Nothing else, including
+# the wider internet.
+
+---
+# ===========================================================================
+# 1. Default deny — everything in the namespace, both directions
+# ===========================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Empty selector = every pod in the namespace.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress/egress rules at all: nothing is permitted except what the
+  # policies below add. NetworkPolicy is purely additive across objects.
+
+---
+# ===========================================================================
+# 2. Ingress to the BFF
+# ===========================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ttl-aware-bff-ingress
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ttl-aware-bff
+      app.kubernetes.io/instance: ttl-aware-bff
+  policyTypes:
+    - Ingress
+  ingress:
+    # --- Public API traffic from the ALB --------------------------------
+    # The AWS Load Balancer Controller in `ip` target mode sends traffic from
+    # the load balancer's ENIs, which are not pods, so there is no pod selector
+    # that matches them. The node CIDR block is used instead; narrow this to
+    # the actual subnet CIDRs from the Terraform `private_subnet_cidrs` output
+    # in a real cluster.
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/16
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # --- Same-namespace callers (integration tests, Helm test pod) --------
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # --- Prometheus scraping the admin port ------------------------------
+    # Matched by namespace label rather than name so it works with whatever
+    # namespace the monitoring stack lives in.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 9090
+
+    # --- Kubelet probes ---------------------------------------------------
+    # Probes originate from the node the pod runs on. Most CNIs exempt
+    # node-to-pod probe traffic; Calico does not by default, hence this rule.
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/16
+      ports:
+        - protocol: TCP
+          port: 9090
+
+---
+# ===========================================================================
+# 3. Egress from the BFF — the allow-list
+# ===========================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ttl-aware-bff-egress
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ttl-aware-bff
+      app.kubernetes.io/instance: ttl-aware-bff
+  policyTypes:
+    - Egress
+  egress:
+    # --- DNS --------------------------------------------------------------
+    # Without this every other rule is dead: the upstreams are addressed by
+    # Service DNS name, not IP. UDP and TCP both, because a large response
+    # falls back to TCP.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # --- Redis / ElastiCache (L2 cache) ----------------------------------
+    # In-cluster Redis (the Helm subchart or the compose-equivalent):
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # ElastiCache lives in the VPC, outside the pod CIDR, so it is reached by
+    # CIDR. Narrow to the ElastiCache subnet CIDRs in a real cluster.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/16
+      ports:
+        - protocol: TCP
+          port: 6379
+
+    # --- Operational Data Source (ODS), gRPC :9101 ------------------------
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ttl-aware-bff-opsource
+      ports:
+        - protocol: TCP
+          port: 9101
+
+    # --- Execution Data Source (EDS), REST :9102 --------------------------
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ttl-aware-bff-exsource
+      ports:
+        - protocol: TCP
+          port: 9102
+
+    # --- OpenTelemetry collector, OTLP/gRPC :4317 -------------------------
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4317
+
+    # Deliberately absent: any 0.0.0.0/0 rule. If the JWKS endpoint
+    # (security.jwt.jwks_url) is internet-hosted, add a narrow HTTPS rule here
+    # for the issuer's addresses, or front it with an in-cluster mirror. Leaving
+    # general internet egress open would defeat the point of this policy.

@@ -1,0 +1,35 @@
+%% Call-time fallback (rule id fallback.primary_failed).
+%% The operational source has just started failing. Its breaker is still closed,
+%% so the pre-flight health snapshot says "available" and the router picks
+%% OPERATIONAL. The call fails. The application layer, not the router, retries
+%% against the configured fallback. This is the rung that catches the first
+%% failures of an outage, before the breaker has learned anything.
+sequenceDiagram
+    autonumber
+    actor UI as Console
+    participant SVC as application.Service
+    participant R as router
+    participant BRK as resilience.Breaker (operational)
+    participant ODS as Operational Data Source
+    participant EDS as Execution Data Source
+
+    UI->>SVC: GET /resources/R007 (resource_read, fallback: execution)
+    SVC->>R: Select(...) with health snapshot
+    BRK-->>R: state=closed -> Health{Available:true, Detail:"HEALTHY"}
+    R-->>SVC: Target=OPERATIONAL, Rule=ttl.operational.fresh<br/>Fallback=EXECUTION carried on the decision
+
+    SVC->>ODS: GetResource (400ms budget, bounded retry)
+    ODS--x SVC: UNAVAILABLE (x3 attempts, retry budget exhausted)
+    ODS-->>BRK: failures recorded in the rolling window
+
+    rect rgb(253, 246, 236)
+        note over SVC: fallbackDecision refuses when falling back would be wrong:<br/>cause not errs.SourceUnusable (404/400/403), consistency=strong,<br/>fallback none or equal to primary, BOTH whose required side failed,<br/>or a fallback that is itself unhealthy.<br/>SourceUnusable = UPSTREAM_TIMEOUT, UPSTREAM_UNAVAILABLE,<br/>UPSTREAM_INVALID_RESPONSE, SCHEMA_VERSION_MISMATCH.
+        SVC->>SVC: cause is SourceUnusable, consistency=bounded,<br/>fallback=EXECUTION and it is healthy -> proceed
+        SVC->>SVC: execution_fallback_total{trigger="call_failure"}++<br/>log WARN "preferred source failed; falling back"
+    end
+
+    SVC->>EDS: GET /resources/R007/latest-execution
+    EDS-->>SVC: execution record
+    SVC-->>UI: 200 OK<br/>meta.routingDecision=EXECUTION<br/>meta.routingRule=fallback.primary_failed<br/>meta.degraded=true<br/>warnings=[SOURCE_UNAVAILABLE]
+
+    note over BRK: Once enough failures accumulate<br/>(failure_threshold 0.5 over minimum_requests 20 in a 30s window)<br/>the breaker opens and subsequent requests take the<br/>*pre-flight* path instead: rule health.primary_unavailable,<br/>and no doomed call is issued at all. That rung is degraded too:<br/>meta.degraded=true with a SOURCE_UNAVAILABLE warning,<br/>exactly as the call-time one is.<br/>A SCHEMA_VERSION_MISMATCH takes this same fallback path<br/>WITHOUT ever moving the breaker: the source is healthy,<br/>only its contract is unintelligible.

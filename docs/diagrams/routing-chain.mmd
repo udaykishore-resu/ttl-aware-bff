@@ -1,0 +1,125 @@
+%% The full pre-flight routing rule chain: eleven rules, evaluated in the order
+%% registered in router.New, first match wins. Every rule id below is a frozen
+%% string that appears in meta.routingRule, in routing_decision_total and as a
+%% span attribute.
+%%
+%% Two nodes are not ordinary decision nodes:
+%%
+%%   * Rules 3 and 4 both PIN the source set, which clears the configured
+%%     fallback: a fallback that cannot supply the requested fields is not a
+%%     fallback, it is a wrong answer, and finish() must not re-attach one.
+%%     They differ in what happens next. Rule 3 terminates; rule 4 CONTINUES
+%%     the chain, because terminating there would skip the TTL rules and with
+%%     them the max_stale ceiling, for the one request type that has nowhere
+%%     else to go. Rule 4 emits its own id only when the ODS is down.
+%%     A pin also binds rule 10: it may not cross to the other source.
+%%   * guard.unconfigured_request_type is a pre-chain exit, not a rule. It
+%%     fires when the request type has no routing rule at all, and it is
+%%     reported to routing_decision_total like any other decision so that a
+%%     deployment which lost a request type is visible in the metric an
+%%     operator reads first.
+%%   * fallback.primary_failed is not part of this chain at all: it is a
+%%     POST-ROUTING step, stamped by the application layer after a source call
+%%     has actually failed. It is drawn below the dispatch node.
+flowchart TD
+    S([Select: classification + frozen health snapshot + now]) --> G0
+
+    G0{"0 guard.unconfigured_request_type<br/>is a routing rule configured<br/>for this request type?"}
+    G0 -- no --> DG0["Target=NONE<br/>503 NO_SOURCE_AVAILABLE<br/>emitted to routing_decision_total"]
+    G0 -- yes --> R1
+
+    R1{"1 guard.tenant_missing<br/>tenant id blank?"}
+    R1 -- yes --> D1["Target=NONE<br/>400 INVALID_REQUEST"]
+    R1 -- no --> R2
+
+    R2{"2 health.both_unavailable<br/>neither source available?"}
+    R2 -- yes --> D2["Target=NONE<br/>application layer tries the stale ladder"]
+    R2 -- no --> R3
+
+    R3{"3 fields.execution_only<br/>every required field has exactly<br/>one supplier and it is EXECUTION?"}
+    R3 -- "yes, EDS healthy" --> D3["PIN preferred=EXECUTION,<br/>clear the configured fallback,<br/>then TERMINATE<br/>Target=EXECUTION"]
+    R3 -- "yes, EDS unhealthy" --> D3b["Target=NONE<br/>nothing to fall back to"]
+    R3 -- no --> R4
+
+    R4{"4 fields.operational_only<br/>same test for OPERATIONAL?"}
+    R4 -- "yes, ODS healthy" --> P4["PIN preferred=OPERATIONAL,<br/>clear the configured fallback,<br/>then CONTINUE the chain<br/>(so the max_stale ceiling still applies)"]
+    R4 -- "yes, ODS unhealthy" --> D4b["Target=NONE<br/>rule id fields.operational_only"]
+    R4 -- no --> R5
+    P4 --> R5
+
+    R5{"5 fields.span_both<br/>required fields need both sources?"}
+    R5 -- both healthy --> D5["Target=BOTH"]
+    R5 -- only ODS healthy --> D5a["Target=OPERATIONAL"]
+    R5 -- only EDS healthy --> D5b["Target=EXECUTION"]
+    R5 -- no --> R6
+
+    R6{"6 consistency.strong_requires_operational<br/>consistency = strong?"}
+    R6 -- yes, preferred healthy --> D6["Target=preferred source, read live<br/>AllowStale forced false"]
+    R6 -- yes, preferred unhealthy --> D6b["Target=NONE"]
+    R6 -- no --> R7
+
+    R7{"7 health.primary_unavailable<br/>preferred source unavailable?"}
+    R7 -- yes, healthy fallback --> D7["Target=fallback<br/>execution_fallback_total++"]
+    R7 -- yes, preferred=both, one side up --> D7b["Target=the healthy side"]
+    R7 -- yes, nothing left --> D7c["Target=NONE"]
+    R7 -- no --> R8
+
+    R8{"8 ttl.operational.fresh<br/>preferred=operational and<br/>probe verdict FRESH?"}
+    R8 -- yes --> D8["Target=OPERATIONAL<br/>operational_ttl_hit_total++<br/>EDS never contacted"]
+    R8 -- no --> R9
+
+    R9{"9 ttl.operational.stale<br/>verdict STALE?"}
+    R9 -- "healthy fallback exists" --> D9a["Target=fallback<br/>operational_ttl_miss_total++<br/>execution_fallback_total++"]
+    R9 -- "no fallback, allow_stale, age <= max_stale" --> D9b["Target=OPERATIONAL<br/>degraded=true, warning STALE_DATA"]
+    R9 -- "no fallback, stale forbidden or past max_stale" --> D9c["Target=NONE"]
+    R9 -- not stale --> R10
+
+    R10{"10 ttl.unknown_freshness<br/>verdict UNKNOWN?<br/>probe failed or disabled"}
+    R10 -- "on_unknown_freshness = none" --> D10n["Target=NONE<br/>the operator chose to fail<br/>rather than guess"]
+    R10 -- "configured source healthy" --> D10["Target=that source<br/>default: operational<br/>(an UNPARSEABLE value falls back<br/>to operational; 'none' does not)"]
+    R10 -- "it is down, other side healthy,<br/>and no field-rule pinned the set" --> D10b["Target=the other source"]
+    R10 -- "pinned, or neither side up" --> D10c["Target=NONE"]
+    R10 -- no --> R11
+
+    R11["11 default.preferred_source<br/>unconditional chain terminator"]
+    R11 --> D11["Target = preferred_source<br/>operational | execution | both"]
+
+    D3 --> DISPATCH
+    D5 --> DISPATCH
+    D5a --> DISPATCH
+    D5b --> DISPATCH
+    D6 --> DISPATCH
+    D7 --> DISPATCH
+    D7b --> DISPATCH
+    D8 --> DISPATCH
+    D9a --> DISPATCH
+    D9b --> DISPATCH
+    D10 --> DISPATCH
+    D10b --> DISPATCH
+    D11 --> DISPATCH
+
+    DISPATCH{{"dispatch: aggregation.FanOut over the selected sources"}}
+    DISPATCH -- required source failed --> FB{"12 fallback.primary_failed — POST-ROUTING<br/>stamped by the application layer, not by the chain:<br/>errs.SourceUnusable(cause), consistency not strong,<br/>a different fallback configured and healthy?"}
+    FB -- yes --> FBY["re-fetch against the fallback<br/>degraded=true, warning SOURCE_UNAVAILABLE<br/>naming the source that FAILED<br/>execution_fallback_total{trigger=call_failure}++<br/>206 partial if the fallback cannot<br/>supply every requested field"]
+    FB -- no --> LADDER
+    D1 --> ERR([error envelope])
+    DG0 --> LADDER
+    D10n --> LADDER
+    D2 --> LADDER
+    D3b --> LADDER
+    D4b --> LADDER
+    D6b --> LADDER
+    D7c --> LADDER
+    D9c --> LADDER
+    D10c --> LADDER
+
+    LADDER{"degrade.stale_cache<br/>allow_stale, entry within max_stale,<br/>consistency not strong?"}
+    LADDER -- yes --> STALE["200 with degraded=true<br/>stale_response_total++"]
+    LADDER -- no --> S503["503 NO_SOURCE_AVAILABLE<br/>or the upstream error's own status"]
+
+    classDef terminal fill:#eef7ee,stroke:#4b7a4b,color:#1b2733
+    classDef bad fill:#fdf0f0,stroke:#a05252,color:#1b2733
+    classDef pin fill:#f5f0fa,stroke:#6b5b8a,color:#1b2733
+    class D8,D3,D5,D11 terminal
+    class P4 pin
+    class D1,D2,D3b,D4b,D6b,D7c,D9c,D10c,D10n,DG0,S503 bad

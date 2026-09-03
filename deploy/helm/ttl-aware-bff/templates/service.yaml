@@ -1,0 +1,72 @@
+{{/*
+Cluster-internal Service: target of the Ingress and of the ServiceMonitor.
+Both the public API port and the admin port are exposed here; only the API port
+is ever routed from outside (see ingress.yaml and networkpolicy.yaml).
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ttl-aware-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+  {{- if or .Values.service.annotations .Values.commonAnnotations }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.service.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  # The BFF is stateless and its cache is shared, so any pod can serve any
+  # request; affinity would only unbalance the fleet.
+  sessionAffinity: None
+  # Endpoints stay out of rotation until readiness passes. This is the default,
+  # stated because the graceful-drain behaviour depends on it.
+  publishNotReadyAddresses: false
+  selector:
+    {{- include "ttl-aware-bff.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin
+      protocol: TCP
+      appProtocol: http
+
+{{- if .Values.service.headless.enabled }}
+---
+{{/*
+Headless variant: DNS returns one A record per ready pod. Useful for
+`kubectl port-forward` against a specific replica and for pulling pprof from
+one pod without going through the load balancer.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-headless" (include "ttl-aware-bff.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "ttl-aware-bff.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

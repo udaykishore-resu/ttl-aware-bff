@@ -1,0 +1,49 @@
+%% BOTH fan-out: GET /api/v1/resources/R007/details.
+%% Three concurrent tasks, each with its own derived context and its own budget
+%% from routing.request_types.resource_details.per_source_timeout. No task can
+%% cancel another; the fan-out waits for all of them.
+sequenceDiagram
+    autonumber
+    participant SVC as application.Service
+    participant AGG as aggregation.FanOut
+    participant T1 as task ods.read<br/>required=true, 400ms
+    participant T2 as task eds.latest<br/>required=false, 1500ms
+    participant T3 as task eds.history<br/>required=false, 1500ms
+    participant ODS as Operational Data Source
+    participant EDS as Execution Data Source
+    participant P as policy.SourcePrecedence
+
+    SVC->>SVC: route -> Target=BOTH, Rule=fields.span_both<br/>(required fields include configuration, operational-only,<br/>and latestExecution, execution-only)<br/>required_sources {operational:true, execution:false}
+    SVC->>AGG: FanOut([ods.read, eds.latest, eds.history])
+
+    par operational branch
+        AGG->>T1: run with ctx deadline 400ms
+        T1->>ODS: GetResource
+        ODS-->>T1: full record (~5ms)
+        T1-->>AGG: ok
+    and execution latest
+        AGG->>T2: run with ctx deadline 1500ms
+        T2->>EDS: GET /resources/R007/latest-execution
+        EDS-->>T2: execution (~120-180ms)
+        T2-->>AGG: ok
+    and execution history
+        AGG->>T3: run with ctx deadline 1500ms
+        T3->>EDS: GET /executions?resourceId=R007&limit=25
+        EDS-->>T3: page (~120-180ms)
+        T3-->>AGG: ok
+    end
+
+    AGG-->>SVC: FanOutResult{Partial:false,<br/>Elapsed = max(branch), not the sum}
+
+    note over SVC: elapsed is the slowest branch. Two EDS calls in parallel<br/>cost one EDS round trip, which is REQ-PERF-006.
+
+    SVC->>SVC: EvaluateFreshness(operational envelope, ttl=30s)
+    SVC->>P: Resolve("status", [operational candidate, execution candidate])
+    alt latest execution is in progress and field is in execution_overrides_when_running
+        P-->>SVC: winner=EXECUTION, rule=precedence.execution_overrides_running
+    else otherwise
+        P-->>SVC: winner=OPERATIONAL, rule=precedence.configured_order
+    end
+    SVC-->>SVC: meta.provenance records the winner per field
+
+    note over AGG,SVC: If eds.latest or eds.history had failed, they are optional:<br/>FanOutResult.Partial=true, one warning each<br/>(SOURCE_TIMEOUT or SOURCE_UNAVAILABLE), response 206.<br/>If ods.read had failed, it is required: fan-out returns an error<br/>and the call-time fallback / stale ladder takes over.

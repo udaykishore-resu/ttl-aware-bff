@@ -1,0 +1,118 @@
+# Ingress for the BFF, fronted by an AWS Application Load Balancer.
+#
+# Managed by the AWS Load Balancer Controller (v2.7+). The controller reads the
+# alb.ingress.kubernetes.io/* annotations below and reconciles a real ALB,
+# listeners, target groups and rules.
+#
+# Only the public API port (8080) is ever routed. The admin port (9090) carries
+# /metrics and the probes and must never be reachable from the internet — it is
+# absent from every rule here, and the NetworkPolicy restricts it to the
+# monitoring namespace.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ttl-aware-bff
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/component: bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # --- Load balancer shape --------------------------------------------
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # `ip` mode registers pod IPs directly. Compared with `instance` mode this
+    # removes the extra kube-proxy hop, makes the ALB's own health checks the
+    # source of truth for readiness, and is what makes the preStop drain in
+    # deployment.yaml effective.
+    alb.ingress.kubernetes.io/target-type: ip
+    # Share one ALB across every Ingress carrying this group name. Saves both
+    # money and IP addresses; `order` decides rule precedence within the group.
+    alb.ingress.kubernetes.io/group.name: bff-public
+    alb.ingress.kubernetes.io/group.order: "10"
+    alb.ingress.kubernetes.io/load-balancer-name: ttl-aware-bff-alb
+
+    # --- Listeners and TLS ------------------------------------------------
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    # Terraform emits the real ARN as the `acm_certificate_arn` output of
+    # deploy/terraform/modules/alb; the overlays substitute it.
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+    # TLS 1.2 minimum, forward secrecy only.
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # Every plaintext request is 301'd to HTTPS by the listener itself, so the
+    # BFF never sees an unencrypted request.
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+
+    # --- Health checks (ALB target group) --------------------------------
+    # The ALB probes the ADMIN port, matching the kubelet's readinessProbe, so
+    # both agree on when a pod may take traffic.
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-port: "9090"
+    alb.ingress.kubernetes.io/healthcheck-path: /readyz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "10"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # --- Target group tuning ---------------------------------------------
+    # deregistration_delay must be >= the pod's terminationGracePeriodSeconds
+    # (45s in deployment.yaml) or the ALB stops draining before the pod has
+    # finished serving in-flight requests.
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      deregistration_delay.timeout_seconds=60,
+      load_balancing.algorithm.type=least_outstanding_requests,
+      stickiness.enabled=false
+    # Idle timeout above the BFF's own write_timeout (10s) plus the slowest
+    # possible fan-out, so the ALB is never the component that cuts a response.
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      idle_timeout.timeout_seconds=60,
+      routing.http2.enabled=true,
+      routing.http.drop_invalid_header_fields.enabled=true,
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=ttl-aware-bff-alb-logs,
+      access_logs.s3.prefix=bff
+
+    # --- WAF --------------------------------------------------------------
+    # Associates the regional Web ACL created by
+    # deploy/terraform/modules/alb (output `waf_web_acl_arn`). Remove this
+    # annotation only if the WAF is attached out-of-band; leaving a public ALB
+    # with no Web ACL is the gap this exists to close.
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:us-east-1:000000000000:regional/webacl/ttl-aware-bff-waf/00000000-0000-0000-0000-000000000000"
+    # AWS Shield Advanced; harmless when not subscribed.
+    alb.ingress.kubernetes.io/shield-advanced-protection: "false"
+
+    # --- Observability ----------------------------------------------------
+    # Adds X-Amzn-Trace-Id; the BFF joins it to the W3C traceparent chain.
+    alb.ingress.kubernetes.io/load-balancer-attributes.routing.http.xff_header_processing.mode: append
+
+    # --- Tags mirrored onto every AWS resource the controller creates -----
+    alb.ingress.kubernetes.io/tags: >-
+      Project=ttl-aware-bff,
+      Component=bff,
+      Environment=production,
+      ManagedBy=aws-load-balancer-controller
+spec:
+  ingressClassName: alb
+  tls:
+    # The ALB terminates TLS using the certificate-arn annotation above; this
+    # block exists so the intent is visible in the manifest and so any other
+    # ingress controller reading it behaves the same way.
+    - hosts:
+        - bff.example.com
+      secretName: ttl-aware-bff-tls
+  rules:
+    - host: bff.example.com
+      http:
+        paths:
+          # Only /api/v1 is published. A request to /metrics or /readyz through
+          # the ALB gets a 404 from the listener, never reaching a pod.
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: ttl-aware-bff
+                port:
+                  name: http

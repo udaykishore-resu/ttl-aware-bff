@@ -1,0 +1,465 @@
+# Tag-triggered release.
+#
+# Triggered by pushing a SemVer tag:
+#
+#   git tag -a v1.2.3 -m "release 1.2.3" && git push origin v1.2.3
+#
+# What a release produces:
+#   - multi-arch (amd64 + arm64) images for all three binaries, pushed to GHCR
+#     and signed with cosign, tagged with the full and partial version
+#   - the Helm chart packaged and pushed to GHCR as an OCI artifact
+#   - cross-compiled binaries and checksums
+#   - a GitHub Release with SBOMs attached
+#
+# ci.yaml explicitly ignores tags so the two pipelines never race on the same
+# commit.
+
+name: Release
+
+on:
+  push:
+    tags:
+      # SemVer with an optional prerelease suffix: v1.2.3, v1.2.3-rc.1.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+# A release must never be cancelled halfway: a partially pushed manifest list
+# is worse than no release at all.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+  REGISTRY: ghcr.io
+  CHART_PATH: deploy/helm/ttl-aware-bff
+
+jobs:
+  # =========================================================================
+  # 1. Guard: the tag must describe a releasable commit
+  # =========================================================================
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_no_v: ${{ steps.version.outputs.version_no_v }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Parse version
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME}"           # v1.2.3
+          version_no_v="${version#v}"            # 1.2.3
+
+          # Anything after a hyphen is a SemVer prerelease identifier.
+          if [[ "${version_no_v}" == *-* ]]; then
+            is_prerelease=true
+          else
+            is_prerelease=false
+          fi
+
+          echo "version=${version}"           >> "${GITHUB_OUTPUT}"
+          echo "version_no_v=${version_no_v}" >> "${GITHUB_OUTPUT}"
+          echo "is_prerelease=${is_prerelease}" >> "${GITHUB_OUTPUT}"
+          echo "Releasing ${version} (prerelease: ${is_prerelease})"
+
+      # A tag is not a licence to skip the gates. This is the same suite CI
+      # runs; it is cheap insurance against tagging a commit that never went
+      # through a PR.
+      - name: Tests
+        run: go test -race -timeout=10m ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Chart version matches the tag
+        run: |
+          chart_version="$(grep -E '^version:' "${CHART_PATH}/Chart.yaml" | awk '{print $2}' | tr -d '"')"
+          app_version="$(grep -E '^appVersion:' "${CHART_PATH}/Chart.yaml" | awk '{print $2}' | tr -d '"')"
+          want="${{ steps.version.outputs.version_no_v }}"
+
+          if [ "${chart_version}" != "${want}" ] || [ "${app_version}" != "${want}" ]; then
+            echo "::error::Chart.yaml says version=${chart_version} appVersion=${app_version}, but the tag is ${want}."
+            echo "Bump Chart.yaml in the release commit so the chart and the image cannot drift apart."
+            exit 1
+          fi
+          echo "Chart.yaml agrees with the tag: ${want}"
+
+  # =========================================================================
+  # 2. Cross-compiled binaries
+  # =========================================================================
+  # A goreleaser-style matrix, done with plain `go build` so there is no extra
+  # tool to keep in step with the Dockerfiles' flags.
+  binaries:
+    name: Build ${{ matrix.binary }} ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        binary: [bff, opsource, exsource]
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          # No 64-bit Intel Macs in the target audience; skip that build rather
+          # than ship an archive nobody downloads.
+          - goos: darwin
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          name="${{ matrix.binary }}_${{ needs.verify.outputs.version_no_v }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+
+          # Identical flags to deploy/docker/Dockerfile.* so a downloaded
+          # binary reports the same version string as the containerised one.
+          go build \
+            -trimpath \
+            -tags osusergo,netgo \
+            -ldflags="-s -w \
+              -X main.version=${{ needs.verify.outputs.version }} \
+              -X main.commit=${GITHUB_SHA} \
+              -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o "dist/${name}" \
+            "./cmd/${{ matrix.binary }}"
+
+          # Ship a tar.gz rather than a bare binary so the archive can carry
+          # the licence and the config sample alongside it.
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          rm "dist/${name}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.binary }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          retention-days: 7
+
+  # =========================================================================
+  # 3. Multi-arch images, signed, with SBOMs
+  # =========================================================================
+  images:
+    name: Image ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [verify]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ttl-aware-bff
+            dockerfile: deploy/docker/Dockerfile.bff
+          - image: ttl-aware-bff-opsource
+            dockerfile: deploy/docker/Dockerfile.opsource
+          - image: ttl-aware-bff-exsource
+            dockerfile: deploy/docker/Dockerfile.exsource
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ needs.verify.outputs.is_prerelease == 'false' }}
+            type=sha,format=long,prefix=sha-
+            type=raw,value=latest,enable=${{ needs.verify.outputs.is_prerelease == 'false' }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.version_no_v }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GO_VERSION=${{ env.GO_VERSION }}
+          cache-from: type=gha,scope=release-${{ matrix.image }}
+          cache-to: type=gha,scope=release-${{ matrix.image }},mode=max
+          # SLSA provenance and an in-toto SBOM attached by BuildKit itself,
+          # alongside the Syft SBOM produced below.
+          provenance: mode=max
+          sbom: true
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.verify.outputs.version_no_v }}
+          format: spdx-json
+          artifact-name: sbom-${{ matrix.image }}.spdx.json
+          output-file: sbom-${{ matrix.image }}.spdx.json
+          upload-artifact: true
+
+      - name: Scan the released image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.verify.outputs.version_no_v }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+        env:
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign and attest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          # By digest, always: signing a tag signs a moving target.
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign attest --yes \
+            --predicate "sbom-${{ matrix.image }}.spdx.json" \
+            --type spdxjson \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.image }}
+          path: sbom-${{ matrix.image }}.spdx.json
+          retention-days: 90
+
+  # =========================================================================
+  # 4. Helm chart -> GHCR as an OCI artifact
+  # =========================================================================
+  chart:
+    name: Package and publish the Helm chart
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [verify, images]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login "${REGISTRY}" \
+                --username "${{ github.actor }}" \
+                --password-stdin
+
+      # Vendors the Redis subchart into charts/ so the packaged artifact is
+      # self-contained and installable without network access to Bitnami.
+      - name: Resolve dependencies
+        run: helm dependency update "${CHART_PATH}"
+
+      - name: Lint the chart
+        run: |
+          helm lint "${CHART_PATH}" \
+            --values "${CHART_PATH}/values.yaml"
+          helm lint "${CHART_PATH}" \
+            --values "${CHART_PATH}/values-dev.yaml"
+          helm lint "${CHART_PATH}" \
+            --values "${CHART_PATH}/values-prod.yaml"
+
+      # Rendering is the real test: lint checks syntax, template catches a
+      # helper that produces invalid YAML only for a particular values file.
+      - name: Render the chart
+        run: |
+          for values in values.yaml values-dev.yaml values-prod.yaml; do
+            echo "==> ${values}"
+            helm template release-check "${CHART_PATH}" \
+              --namespace bff \
+              --values "${CHART_PATH}/${values}" > "/tmp/rendered-${values}"
+            # Prove the output is parseable YAML, not merely non-empty.
+            python3 -c "import sys,yaml; list(yaml.safe_load_all(open(sys.argv[1])))" "/tmp/rendered-${values}"
+          done
+
+      - name: Package
+        run: |
+          helm package "${CHART_PATH}" \
+            --version "${{ needs.verify.outputs.version_no_v }}" \
+            --app-version "${{ needs.verify.outputs.version_no_v }}" \
+            --destination dist/
+
+      - name: Push to GHCR
+        id: push
+        run: |
+          chart="dist/ttl-aware-bff-${{ needs.verify.outputs.version_no_v }}.tgz"
+          # The chart lands at
+          #   oci://ghcr.io/<owner>/charts/ttl-aware-bff:<version>
+          helm push "${chart}" "oci://${REGISTRY}/${{ github.repository_owner }}/charts" \
+            2>&1 | tee push.log
+
+          digest="$(grep -oE 'sha256:[0-9a-f]{64}' push.log | head -1)"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the chart
+        run: |
+          cosign sign --yes \
+            "${REGISTRY}/${{ github.repository_owner }}/charts/ttl-aware-bff@${{ steps.push.outputs.digest }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: dist/*.tgz
+          retention-days: 90
+
+  # =========================================================================
+  # 5. GitHub Release
+  # =========================================================================
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [verify, binaries, images, chart]
+    permissions:
+      # The only job in this file that writes to the repository.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Assemble release assets
+        run: |
+          mkdir -p release
+          # Flatten the per-matrix-leg artifact directories.
+          find artifacts/ -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.spdx.json' \) \
+            -exec cp {} release/ \;
+
+          cd release
+          sha256sum ./* > SHA256SUMS
+          ls -la
+
+      - name: Generate the changelog
+        id: changelog
+        run: |
+          previous="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+
+          {
+            echo "## ${GITHUB_REF_NAME}"
+            echo ""
+            if [ -n "${previous}" ]; then
+              echo "### Changes since ${previous}"
+              echo ""
+              git log --pretty=format:'- %s (%h)' "${previous}..${GITHUB_REF_NAME}"
+            else
+              echo "### Initial release"
+              echo ""
+              git log --pretty=format:'- %s (%h)' -20
+            fi
+            echo ""
+            echo ""
+            echo "### Container images"
+            echo ""
+            echo '```'
+            for image in ttl-aware-bff ttl-aware-bff-opsource ttl-aware-bff-exsource; do
+              echo "ghcr.io/${{ github.repository_owner }}/${image}:${{ needs.verify.outputs.version_no_v }}"
+            done
+            echo '```'
+            echo ""
+            echo "All images are multi-arch (linux/amd64, linux/arm64) and signed with cosign:"
+            echo ""
+            echo '```'
+            echo "cosign verify ghcr.io/${{ github.repository_owner }}/ttl-aware-bff:${{ needs.verify.outputs.version_no_v }} \\"
+            echo "  --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.github/workflows/.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+            echo ""
+            echo "### Helm chart"
+            echo ""
+            echo '```'
+            echo "helm install bff oci://ghcr.io/${{ github.repository_owner }}/charts/ttl-aware-bff \\"
+            echo "  --version ${{ needs.verify.outputs.version_no_v }} \\"
+            echo "  --namespace bff --create-namespace"
+            echo '```'
+            echo ""
+            echo "### Supply chain"
+            echo ""
+            echo "SPDX SBOMs for every image are attached below and also published as"
+            echo "cosign attestations on the images themselves."
+          } > CHANGELOG_RELEASE.md
+
+          cat CHANGELOG_RELEASE.md
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.verify.outputs.version }}
+          body_path: CHANGELOG_RELEASE.md
+          prerelease: ${{ needs.verify.outputs.is_prerelease == 'true' }}
+          draft: false
+          files: |
+            release/*.tar.gz
+            release/*.tgz
+            release/*.spdx.json
+            release/SHA256SUMS
+          fail_on_unmatched_files: true

@@ -1,0 +1,158 @@
+# Development overlay.
+#
+#   kubectl apply -k deploy/k8s/overlays/dev
+#
+# What dev changes, and why:
+#   - 1 replica and a tiny resource footprint (cost, and dev clusters are small)
+#   - full trace sampling and debug logs (you are here to see what happened)
+#   - shorter TTLs, so a stale/fresh transition is observable in seconds
+#   - the in-namespace Redis rather than ElastiCache
+#   - no HPA and no PDB: both fight with a 1-replica deployment
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: bff
+nameSuffix: ""
+
+resources:
+  - ../../
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/environment: dev
+
+commonAnnotations:
+  bff.internal/environment: dev
+
+images:
+  - name: ghcr.io/udaykishore/ttl-aware-bff
+    newTag: dev
+
+# A 1-replica deployment cannot satisfy a PDB with maxUnavailable: 1 and an HPA
+# with minReplicas: 3, so both are removed rather than patched into
+# inconsistency.
+patches:
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: ttl-aware-bff
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: ttl-aware-bff
+
+  - target:
+      group: policy
+      version: v1
+      kind: PodDisruptionBudget
+      name: ttl-aware-bff
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: ttl-aware-bff
+
+  # --- Deployment: single small replica, verbose telemetry ---------------
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: ttl-aware-bff
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ttl-aware-bff
+      spec:
+        replicas: 1
+        template:
+          spec:
+            # One replica cannot spread across zones; the DoNotSchedule
+            # constraint in the base would leave it Pending.
+            topologySpreadConstraints: []
+            containers:
+              - name: bff
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 128Mi
+                  limits:
+                    memory: 512Mi
+                env:
+                  - name: BFF_OBSERVABILITY__ENVIRONMENT
+                    value: "dev"
+                  - name: BFF_OBSERVABILITY__LOG__LEVEL
+                    value: "debug"
+                  - name: BFF_OBSERVABILITY__LOG__FORMAT
+                    value: "text"
+                  - name: BFF_OBSERVABILITY__TRACE_SAMPLE_RATIO
+                    value: "1.0"
+                  # Shorter TTLs make the fresh -> stale -> fallback path
+                  # observable without waiting.
+                  - name: BFF_ROUTING__REQUEST_TYPES__RESOURCE_STATUS__TTL
+                    value: "5s"
+                  - name: BFF_ROUTING__REQUEST_TYPES__RESOURCE_CONFIGURATION__TTL
+                    value: "10s"
+                  - name: BFF_CACHE__REDIS__ADDR
+                    value: "ttl-aware-bff-redis.bff.svc.cluster.local:6379"
+                  - name: OTEL_TRACES_SAMPLER
+                    value: "always_on"
+                  - name: OTEL_RESOURCE_ATTRIBUTES
+                    value: "service.namespace=bff,deployment.environment=dev"
+                  - name: GOMEMLIMIT
+                    value: "400MiB"
+
+  # --- ServiceAccount: dev account's IRSA role --------------------------
+  - target:
+      version: v1
+      kind: ServiceAccount
+      name: ttl-aware-bff
+    patch: |-
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: ttl-aware-bff
+        annotations:
+          eks.amazonaws.com/role-arn: "arn:aws:iam::111111111111:role/ttl-aware-bff-irsa-dev"
+
+  # --- Ingress: internal-only ALB on the dev hostname -------------------
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: ttl-aware-bff
+    patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: ttl-aware-bff
+        annotations:
+          alb.ingress.kubernetes.io/scheme: internal
+          alb.ingress.kubernetes.io/group.name: bff-dev
+          alb.ingress.kubernetes.io/load-balancer-name: ttl-aware-bff-alb-dev
+          alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:111111111111:certificate/11111111-1111-1111-1111-111111111111"
+          # No WAF on an internal dev load balancer.
+          alb.ingress.kubernetes.io/wafv2-acl-arn: ""
+          alb.ingress.kubernetes.io/tags: "Project=ttl-aware-bff,Component=bff,Environment=dev,ManagedBy=aws-load-balancer-controller"
+      spec:
+        rules:
+          - host: bff.dev.example.com
+            http:
+              paths:
+                - path: /api/v1
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: ttl-aware-bff
+                      port:
+                        name: http
+        tls:
+          - hosts:
+              - bff.dev.example.com
+            secretName: ttl-aware-bff-tls

@@ -1,0 +1,389 @@
+# docker-compose.yaml — the complete local stack for ttl-aware-bff.
+#
+#   make compose-up      # build + start + wait for health
+#   make compose-down    # stop + remove volumes
+#
+# What comes up:
+#
+#   bff            :8080 API, :9090 admin      the service under development
+#   opsource       :9101 gRPC, :9111 admin     Operational Data Source stub
+#   exsource       :9102 REST, :9112 admin     Execution Data Source stub
+#   redis          :6379                       L2 cache
+#   otel-collector :4317 OTLP, :8889 metrics   telemetry fan-out
+#   jaeger         :16686 UI                   trace storage + UI
+#   prometheus     :9091 UI (9090 in-container) metric storage
+#   grafana        :3000 UI                    dashboards (admin/admin)
+#
+# Ports and image names are fixed by docs/DESIGN-CONTRACT.md §1 and §9.
+# Host port 9091 is used for Prometheus because the BFF admin port already
+# claims 9090 on the host.
+#
+# Useful URLs once up:
+#   http://localhost:8080/api/v1/resources/res-001
+#   http://localhost:9090/metrics
+#   http://localhost:16686        (traces)
+#   http://localhost:3000         (dashboards)
+
+name: ttl-aware-bff
+
+# ---------------------------------------------------------------------------
+# Reusable fragments
+# ---------------------------------------------------------------------------
+
+# Build args shared by the three Go images. RUNTIME_IMAGE swaps the distroless
+# base for its `debug-nonroot` variant, which is byte-identical plus a busybox
+# at /busybox — that is what makes the healthchecks below possible. Production
+# images (CI, release) build without this override and stay shell-free.
+x-go-build: &go-build
+  context: .
+  args:
+    RUNTIME_IMAGE: gcr.io/distroless/static-debian12:debug-nonroot
+    VERSION: local
+    COMMIT: local
+    BUILD_DATE: "1970-01-01T00:00:00Z"
+    # Empty in a normal environment: `go mod download` resolves through
+    # proxy.golang.org. For an air-gapped host, run `go mod vendor` and set
+    # GOFLAGS=-mod=vendor here.
+    GOFLAGS: ""
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Local dev containers are small; these caps mostly exist to make an accidental
+# runaway visible rather than to model production sizing (see the Helm chart's
+# values.yaml for that).
+x-small-limits: &small-limits
+  deploy:
+    resources:
+      limits:
+        memory: 512M
+
+networks:
+  bff-net:
+    name: bff-net
+    driver: bridge
+
+volumes:
+  redis-data:
+    name: bff-redis-data
+  prometheus-data:
+    name: bff-prometheus-data
+  grafana-data:
+    name: bff-grafana-data
+
+services:
+  # =========================================================================
+  # The BFF
+  # =========================================================================
+  bff:
+    build:
+      <<: *go-build
+      dockerfile: deploy/docker/Dockerfile.bff
+    image: ghcr.io/udaykishore/ttl-aware-bff:local
+    container_name: bff
+    networks: [bff-net]
+    ports:
+      - "8080:8080"   # public API
+      - "9090:9090"   # admin: /healthz /readyz /livez /metrics
+    volumes:
+      # Shadow the config baked into the image so edits to configs/bff.yaml take
+      # effect on `docker compose restart bff` without a rebuild.
+      - ./configs/bff.yaml:/etc/bff/bff.yaml:ro
+    command: ["--config", "/etc/bff/bff.yaml"]
+    environment:
+      # ------------------------------------------------------------------
+      # Environment overrides use the BFF_ prefix with `__` as the nesting
+      # separator (docs/DESIGN-CONTRACT.md §6). Every variable below maps
+      # 1:1 onto a key in configs/bff.yaml; these exist to point the file's
+      # defaults (localhost) at compose service names.
+      # ------------------------------------------------------------------
+
+      # server: -> server.http_addr / server.admin_addr
+      BFF_SERVER__HTTP_ADDR: ":8080"
+      BFF_SERVER__ADMIN_ADDR: ":9090"
+      # Kept in step with the K8s terminationGracePeriodSeconds arithmetic in
+      # deploy/k8s/deployment.yaml.
+      BFF_SERVER__SHUTDOWN_GRACE: "25s"
+
+      # sources.operational.* -> the gRPC stub
+      BFF_SOURCES__OPERATIONAL__ADDR: "opsource:9101"
+      BFF_SOURCES__OPERATIONAL__DIAL_TIMEOUT: "2s"
+      BFF_SOURCES__OPERATIONAL__CALL_TIMEOUT: "800ms"
+      BFF_SOURCES__OPERATIONAL__FRESHNESS_PROBE_TIMEOUT: "250ms"
+
+      # sources.execution.* -> the REST stub
+      BFF_SOURCES__EXECUTION__BASE_URL: "http://exsource:9102"
+      BFF_SOURCES__EXECUTION__CALL_TIMEOUT: "1500ms"
+
+      # cache.* -> Redis L2 (L1 stays as configured in the file)
+      BFF_CACHE__ENABLED: "true"
+      BFF_CACHE__BACKEND: "redis"
+      BFF_CACHE__REDIS__ADDR: "redis:6379"
+      BFF_CACHE__REDIS__DB: "0"
+      # The config holds the NAME of the variable that holds the password, not
+      # the password. Empty here because the local Redis has no auth.
+      BFF_CACHE__REDIS__PASSWORD_ENV: "BFF_REDIS_PASSWORD"
+      BFF_REDIS_PASSWORD: ""
+
+      # observability.* -> OTLP/gRPC to the collector
+      BFF_OBSERVABILITY__SERVICE_NAME: "ttl-aware-bff"
+      BFF_OBSERVABILITY__ENVIRONMENT: "local"
+      BFF_OBSERVABILITY__OTLP__ENDPOINT: "otel-collector:4317"
+      BFF_OBSERVABILITY__OTLP__INSECURE: "true"
+      # Sample everything locally; production uses a ratio (see values-prod.yaml).
+      BFF_OBSERVABILITY__TRACE_SAMPLE_RATIO: "1.0"
+      BFF_OBSERVABILITY__LOG__LEVEL: "debug"
+      BFF_OBSERVABILITY__LOG__FORMAT: "text"
+
+      # routing.* -> demonstrates a nested request-type override. Same key the
+      # `acme` tenant block overrides in configs/bff.yaml.
+      BFF_ROUTING__REQUEST_TYPES__RESOURCE_STATUS__TTL: "10s"
+      BFF_ROUTING__DEFAULTS__ALLOW_STALE: "true"
+
+      # security.* -> local dev uses the HS256 path; the named variable below
+      # carries the actual secret.
+      BFF_SECURITY__JWT__HS256_SECRET_ENV: "BFF_JWT_HS256_SECRET"
+      BFF_JWT_HS256_SECRET: "local-development-secret-not-for-any-real-use"
+      BFF_SECURITY__JWT__ISSUER: "https://auth.local/"
+      BFF_SECURITY__JWT__AUDIENCE: "ttl-aware-bff"
+
+      # Standard OTel SDK variables, honoured alongside the BFF_ ones.
+      OTEL_SERVICE_NAME: "ttl-aware-bff"
+      OTEL_RESOURCE_ATTRIBUTES: "service.namespace=bff,deployment.environment=local"
+    depends_on:
+      redis:
+        condition: service_healthy
+      opsource:
+        condition: service_healthy
+      exsource:
+        condition: service_healthy
+      otel-collector:
+        condition: service_healthy
+    healthcheck:
+      # /busybox/wget exists only because of the debug-nonroot base above.
+      # -q -O- keeps it silent; a non-2xx status makes wget exit non-zero.
+      test: ["CMD", "/busybox/wget", "-q", "-O-", "http://127.0.0.1:9090/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+    <<: *small-limits
+
+  # =========================================================================
+  # Operational Data Source stub (gRPC)
+  # =========================================================================
+  opsource:
+    build:
+      <<: *go-build
+      dockerfile: deploy/docker/Dockerfile.opsource
+    image: ghcr.io/udaykishore/ttl-aware-bff-opsource:local
+    container_name: opsource
+    networks: [bff-net]
+    ports:
+      - "9101:9101"   # gRPC
+      - "9111:9111"   # admin + chaos controls
+    environment:
+      OTEL_SERVICE_NAME: "ttl-aware-bff-opsource"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_RESOURCE_ATTRIBUTES: "service.namespace=bff,deployment.environment=local"
+    healthcheck:
+      test: ["CMD", "/busybox/wget", "-q", "-O-", "http://127.0.0.1:9111/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+    <<: *small-limits
+
+  # =========================================================================
+  # Execution Data Source stub (REST)
+  # =========================================================================
+  exsource:
+    build:
+      <<: *go-build
+      dockerfile: deploy/docker/Dockerfile.exsource
+    image: ghcr.io/udaykishore/ttl-aware-bff-exsource:local
+    container_name: exsource
+    networks: [bff-net]
+    ports:
+      - "9102:9102"   # REST
+      - "9112:9112"   # admin + chaos controls
+    environment:
+      OTEL_SERVICE_NAME: "ttl-aware-bff-exsource"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_RESOURCE_ATTRIBUTES: "service.namespace=bff,deployment.environment=local"
+    healthcheck:
+      test: ["CMD", "/busybox/wget", "-q", "-O-", "http://127.0.0.1:9112/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+    <<: *small-limits
+
+  # =========================================================================
+  # Redis — L2 cache
+  # =========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    networks: [bff-net]
+    ports:
+      - "6379:6379"
+    # --save "" disables RDB snapshots: this is a cache, and losing it on
+    # restart is the correct behaviour to exercise locally. maxmemory-policy
+    # allkeys-lru mirrors how the ElastiCache replication group is configured
+    # in deploy/terraform/modules/elasticache.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # =========================================================================
+  # OpenTelemetry Collector (contrib) — traces to Jaeger, metrics to Prometheus
+  # =========================================================================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: otel-collector
+    networks: [bff-net]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./deploy/docker/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"     # OTLP gRPC — what the BFF exports to
+      - "4318:4318"     # OTLP HTTP — handy for curl-based experiments
+      - "8889:8889"     # Prometheus exporter, scraped by prometheus
+      - "13133:13133"   # health_check extension
+      - "55679:55679"   # zpages
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:13133/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # =========================================================================
+  # Jaeger — trace storage and UI
+  # =========================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: jaeger
+    networks: [bff-net]
+    environment:
+      # Jaeger has accepted OTLP natively since 1.35; no jaeger-thrift needed.
+      COLLECTOR_OTLP_ENABLED: "true"
+      # In-memory storage: fine for a laptop, gone on restart.
+      SPAN_STORAGE_TYPE: "memory"
+      MEMORY_MAX_TRACES: "50000"
+    ports:
+      - "16686:16686"   # UI
+      # 4317/4318 are intentionally NOT published: the collector reaches Jaeger
+      # over the bff-net network, and publishing them would collide with the
+      # collector's own OTLP ports on the host.
+    healthcheck:
+      # 14269 is Jaeger's admin port; / returns 200 once the query service is up.
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:14269/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # =========================================================================
+  # Prometheus — metric storage
+  # =========================================================================
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: prometheus
+    networks: [bff-net]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=24h
+      # Needed for Grafana's exemplar link (Prometheus -> Jaeger).
+      - --enable-feature=exemplar-storage
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"   # 9090 on the host belongs to the BFF admin port
+    depends_on:
+      otel-collector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # =========================================================================
+  # Grafana — dashboards
+  # =========================================================================
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: grafana
+    networks: [bff-net]
+    environment:
+      # Local-only credentials. Anonymous viewing is on so the stack is usable
+      # without a login prompt; never mirror this outside a laptop.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Enables the trace-to-metrics and exemplar links configured in
+      # grafana-datasources.yaml.
+      GF_FEATURE_TOGGLES_ENABLE: "traceToMetrics"
+    volumes:
+      - ./deploy/docker/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      jaeger:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging

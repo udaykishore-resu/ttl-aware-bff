@@ -1,0 +1,73 @@
+{{- if .Values.autoscaling.enabled }}
+{{/*
+HorizontalPodAutoscaler.
+
+Two signals, and the HPA takes the MAXIMUM desired replica count across them,
+so either can scale up while both must be under target to scale down:
+
+  CPU utilisation           the general-purpose signal, % of the CPU *request*
+  bff_concurrent_requests   the contract's UpDownCounter (design contract §7)
+
+The second is the one that matters for a BFF. In-flight requests climb the
+moment an upstream slows, well before CPU does, because the extra load is
+goroutines parked on I/O rather than cycles burned. Scaling on it adds capacity
+while requests are queuing instead of after they start timing out.
+
+The custom metric requires prometheus-adapter or KEDA publishing it through
+custom.metrics.k8s.io. Verify with:
+
+  kubectl get --raw \
+    "/apis/custom.metrics.k8s.io/v1beta1/namespaces/{{ .Release.Namespace }}/pods/*/{{ .Values.autoscaling.customMetric.name }}"
+*/}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "ttl-aware-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "ttl-aware-bff.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- with .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+    {{- with .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+    {{- if .Values.autoscaling.customMetric.enabled }}
+    # In-flight requests per pod, averaged across the fleet. The default (40)
+    # is ~60% of the combined bulkhead capacity in config.sources, so the
+    # autoscaler reacts before the bulkheads begin rejecting.
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.customMetric.name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.customMetric.averageValue | quote }}
+    {{- end }}
+  {{- with .Values.autoscaling.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,41 @@
+{{- if .Values.pdb.enabled }}
+{{/*
+PodDisruptionBudget.
+
+Constrains VOLUNTARY disruptions only: node drains, cluster-autoscaler
+consolidation, `kubectl drain` during a control-plane upgrade. It does not
+protect against node failure or eviction under node pressure.
+
+maxUnavailable rather than minAvailable is the default because the HPA moves
+the replica count over a wide range: a fixed minAvailable is either useless at
+the top of that range or blocks every drain at the bottom of it.
+
+The rollout does not consume this budget — updateStrategy uses maxUnavailable:
+0 / maxSurge: 1 — so the budget exists purely for the node lifecycle.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ttl-aware-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.pdb.minAvailable }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ttl-aware-bff.selectorLabels" . | nindent 6 }}
+  {{- with .Values.pdb.unhealthyPodEvictionPolicy }}
+  # Without this, a fleet that is already broken in a way readiness detects can
+  # wedge a node drain indefinitely.
+  unhealthyPodEvictionPolicy: {{ . }}
+  {{- end }}
+{{- end }}

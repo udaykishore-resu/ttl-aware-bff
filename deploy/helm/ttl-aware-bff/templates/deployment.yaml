@@ -1,0 +1,278 @@
+{{/*
+Deployment for the TTL-aware BFF.
+
+Shutdown arithmetic — the three numbers must stay consistent:
+  preStopSleepSeconds (10) + config.server.shutdown_grace (25s)
+    < terminationGracePeriodSeconds (45)
+The grace period covers BOTH the preStop hook and the SIGTERM drain, so it must
+exceed their sum or the kubelet SIGKILLs a pod that is still serving.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ttl-aware-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: "TTL-aware BFF routing between the operational (gRPC) and execution (REST) data sources."
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- /* When the HPA owns the replica count, omitting the field entirely stops
+         `helm upgrade` from resetting a scale-up back to the chart default. */}}
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  selector:
+    matchLabels:
+      {{- include "ttl-aware-bff.selectorLabels" . | nindent 6 }}
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ttl-aware-bff.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: bff
+        app.kubernetes.io/part-of: ttl-aware-bff
+        app.kubernetes.io/version: {{ include "ttl-aware-bff.imageTag" . | quote }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- /* Hashing the rendered config means a TTL change rolls the fleet.
+               Without this a `helm upgrade` that only touches values would
+               update the ConfigMap and leave every pod running the old copy. */}}
+        checksum/config: {{ include "ttl-aware-bff.config" . | sha256sum }}
+        {{- if and .Values.secrets.create (not .Values.secrets.existingSecret) }}
+        checksum/secret: {{ toYaml .Values.secrets.data | sha256sum }}
+        {{- end }}
+        {{- /* Scraping is done by the ServiceMonitor; false here stops a
+               cluster running annotation-based discovery double-scraping. */}}
+        prometheus.io/scrape: "false"
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ttl-aware-bff.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      dnsPolicy: ClusterFirst
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- /* The selector is injected rather than configured, so a values file
+               cannot accidentally spread the wrong set of pods. */}}
+        {{- range . }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "ttl-aware-bff.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}
+
+      containers:
+        - name: bff
+          image: {{ include "ttl-aware-bff.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/bff/bff.yaml"]
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 9090
+              protocol: TCP
+
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+
+          env:
+            # --- Pod identity (downward API) ------------------------------
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+            {{- /* GOMAXPROCS from the CPU limit when one exists. Without it the
+                   Go runtime sees the node's core count, oversubscribes P's and
+                   burns the CFS quota on scheduling latency. This chart sets no
+                   CPU limit by default, so the request is used instead. */}}
+            - name: GOMAXPROCS
+              valueFrom:
+                resourceFieldRef:
+                  containerName: bff
+                  resource: {{ if and .Values.resources.limits .Values.resources.limits.cpu }}limits.cpu{{ else }}requests.cpu{{ end }}
+                  divisor: "1"
+            {{- with .Values.goMemLimit }}
+            - name: GOMEMLIMIT
+              value: {{ . | quote }}
+            {{- end }}
+
+            {{- if .Values.otel.enabled }}
+            # --- OpenTelemetry SDK ----------------------------------------
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.otel.serviceName | quote }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ printf "%s://%s" (ternary "http" "https" .Values.otel.insecure) .Values.otel.endpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: {{ .Values.otel.protocol | quote }}
+            - name: OTEL_TRACES_SAMPLER
+              value: "parentbased_traceidratio"
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: {{ .Values.otel.traceSampleRatio | quote }}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: {{ include "ttl-aware-bff.otelResourceAttributes" . | quote }}
+            - name: OTEL_PROPAGATORS
+              value: {{ .Values.otel.propagators | quote }}
+            {{- else }}
+            # Telemetry disabled: the SDK falls back to a no-op exporter.
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+            {{- end }}
+
+            {{- /* Everything the config file already carries is NOT repeated
+                   here. These few exist because they are per-environment and
+                   would otherwise be duplicated in the config block too. */}}
+            - name: BFF_OBSERVABILITY__ENVIRONMENT
+              value: {{ .Values.otel.environment | quote }}
+            - name: BFF_OBSERVABILITY__SERVICE_VERSION
+              value: {{ include "ttl-aware-bff.imageTag" . | quote }}
+
+            {{- with .Values.extraEnv }}
+            # --- extraEnv (last wins on a duplicate name) -----------------
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          {{- $secretName := include "ttl-aware-bff.secretName" . }}
+          {{- if or $secretName .Values.extraEnvFrom }}
+          envFrom:
+            {{- if $secretName }}
+            # Credentials only. Keys are the env-var names that
+            # cache.redis.password_env and security.jwt.hs256_secret_env
+            # point at.
+            - secretRef:
+                name: {{ $secretName }}
+                optional: false
+            {{- end }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+
+          {{- /* Probes, all on the admin port:
+                   /healthz  process up, config parsed        -> startup
+                   /readyz   dependencies usable, drain-aware -> readiness
+                   /livez    event loop responsive            -> liveness */}}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: admin
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: admin
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            successThreshold: {{ .Values.probes.readiness.successThreshold }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: admin
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            successThreshold: {{ .Values.probes.liveness.successThreshold }}
+            # More forgiving than readiness on purpose: a slow upstream must
+            # cost readiness, never a restart.
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+
+          {{- if gt (int .Values.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              # Endpoint removal and SIGTERM race each other. Sleeping first
+              # lets the ALB target group and kube-proxy stop sending new
+              # connections while the server still accepts them.
+              #
+              # The native `sleep` handler needs Kubernetes >= 1.30; a
+              # distroless image cannot run an exec hook, which is why the
+              # chart's kubeVersion floor is 1.30.
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds }}
+          {{- end }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/bff
+              readOnly: true
+            # readOnlyRootFilesystem: true means the runtime still needs a
+            # writable /tmp and a scratch directory.
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/bff
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ttl-aware-bff.configMapName" . }}
+            items:
+              - key: bff.yaml
+                path: bff.yaml
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: cache
+          emptyDir:
+            sizeLimit: 256Mi
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

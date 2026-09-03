@@ -1,0 +1,80 @@
+# Services for the BFF.
+#
+# Two are defined:
+#   ttl-aware-bff        the routable Service (API + admin), target of the
+#                        Ingress and of the ServiceMonitor
+#   ttl-aware-bff-headless  a headless Service, used by anything that needs the
+#                        individual pod addresses (debugging, direct pprof)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ttl-aware-bff
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/component: bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # The AWS Load Balancer Controller in `ip` target mode registers pod IPs
+    # directly with the target group, which is why this stays a ClusterIP
+    # Service rather than a NodePort.
+    kubernetes.io/description: "Cluster-internal endpoint for the TTL-aware BFF."
+spec:
+  type: ClusterIP
+  # Session affinity off: the BFF is stateless and the cache is shared, so any
+  # pod can serve any request.
+  sessionAffinity: None
+  # Keep endpoints out of rotation until readiness passes. This is the default,
+  # stated explicitly because the drain behaviour depends on it.
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+      # The ALB Ingress and any in-cluster caller use this port.
+      appProtocol: http
+    - name: admin
+      port: 9090
+      targetPort: admin
+      protocol: TCP
+      # Scraped by the ServiceMonitor. Never routed from the Ingress: the
+      # ingress rule below only ever names the `http` port.
+      appProtocol: http
+
+---
+# Headless variant: no cluster IP, DNS returns one A record per ready pod as
+# ttl-aware-bff-headless.bff.svc.cluster.local. Useful for
+# `kubectl port-forward` against a specific replica and for pulling pprof from
+# one pod without hitting the load balancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ttl-aware-bff-headless
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/component: bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: admin
+      port: 9090
+      targetPort: admin
+      protocol: TCP

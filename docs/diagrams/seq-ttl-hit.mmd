@@ -1,0 +1,38 @@
+%% TTL hit: GET /api/v1/resources/R007/status, operational record inside its
+%% 10s freshness TTL. The execution source is never contacted.
+sequenceDiagram
+    autonumber
+    actor UI as Console
+    participant H as api/handler
+    participant CL as classifier
+    participant CA as cache.Manager
+    participant SVC as application.Service
+    participant R as router
+    participant F as freshness.Manager
+    participant ODS as Operational Data Source
+    participant EDS as Execution Data Source
+
+    UI->>H: GET /resources/R007/status<br/>X-Tenant-ID: local
+    H->>CL: Classify(route, tenant, resource)
+    CL-->>H: type=resource_status<br/>fields={status}<br/>consistency=bounded
+    H->>SVC: GetResourceStatus(classification)
+    SVC->>CA: GetOrLoad(key, cache_ttl=3s, loader)
+    CA-->>SVC: miss
+
+    rect rgb(238, 247, 238)
+        note over SVC,R: loader — the cache-miss path
+        SVC->>R: Select(classification, health snapshot)
+        R->>F: Assess(tenant, R007, ttl=10s, skew=2s)
+        F->>ODS: GetResourceFreshness (probe, 120ms budget)
+        ODS-->>F: last_updated, server_time, version
+        F-->>R: FRESH, age 0.4s <= ttl 10s
+        R-->>SVC: Target=OPERATIONAL<br/>Rule=ttl.operational.fresh
+        SVC->>ODS: GetResourceState (narrow read, 400ms budget)
+        ODS-->>SVC: state, substate, freshness envelope,<br/>in_flight_execution_ref = ""
+        note over SVC,EDS: no in-flight reference, so resolve_in_flight_execution<br/>does not fire and the EDS is not called at all
+        SVC->>SVC: merge (single candidate) + project to statusView
+    end
+
+    SVC->>CA: store entry (logical 3s, physical 3s + stale_grace 5m)
+    SVC-->>H: Envelope{data, meta}
+    H-->>UI: 200 OK<br/>X-BFF-Freshness: FRESH, X-BFF-Source: OPERATIONAL<br/>meta.routingRule=ttl.operational.fresh<br/>meta.sources=[OPERATIONAL], degraded=false

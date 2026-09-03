@@ -1,0 +1,187 @@
+// Operational Data Source (ODS) gRPC contract.
+//
+// The ODS is the low-latency, current-state source of truth. Its schema is
+// deliberately DIFFERENT from the canonical BFF domain model: it is
+// resource-centric, uses its own enum vocabulary ("state" not "status"),
+// carries operational metadata, and exposes a dedicated cheap freshness probe
+// so the BFF can make a TTL routing decision WITHOUT paying for a full read.
+//
+// Traceability: REQ-DS-001, REQ-DS-002, REQ-RT-003, REQ-PERF-002
+syntax = "proto3";
+
+package operational.v1;
+
+option go_package = "github.com/udaykishore/ttl-aware-bff/internal/datasource/operational/opsv1;opsv1";
+
+import "google/protobuf/timestamp.proto";
+
+service OperationalService {
+  // Cheap probe: returns ONLY the freshness envelope for a resource.
+  // Used by the BFF TTL/Freshness Manager to route before fetching.
+  rpc GetResourceFreshness(GetResourceFreshnessRequest) returns (GetResourceFreshnessResponse);
+
+  // Full current-state read.
+  rpc GetResource(GetResourceRequest) returns (GetResourceResponse);
+
+  // Narrow read used by the /status endpoint.
+  rpc GetResourceState(GetResourceStateRequest) returns (GetResourceStateResponse);
+
+  // Batch read (connection reuse / fan-in optimisation).
+  rpc BatchGetResources(BatchGetResourcesRequest) returns (BatchGetResourcesResponse);
+
+  // Liveness/health of the source itself.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Source-native enums. NOTE: the vocabulary differs from the canonical model on
+// purpose ("PROVISIONING" vs canonical PENDING, etc). Mapping is explicit in
+// internal/mapper/operational.go.
+// ---------------------------------------------------------------------------
+enum ResourceState {
+  RESOURCE_STATE_UNSPECIFIED = 0;
+  RESOURCE_STATE_PROVISIONING = 1;
+  RESOURCE_STATE_ACTIVE = 2;
+  RESOURCE_STATE_SUSPENDED = 3;
+  RESOURCE_STATE_DEGRADED = 4;
+  RESOURCE_STATE_TERMINATING = 5;
+  RESOURCE_STATE_TERMINATED = 6;
+  RESOURCE_STATE_ERROR = 7;
+}
+
+enum HealthState {
+  HEALTH_STATE_UNSPECIFIED = 0;
+  HEALTH_STATE_SERVING = 1;
+  HEALTH_STATE_DEGRADED = 2;
+  HEALTH_STATE_NOT_SERVING = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+// Every read carries tenant context; the source enforces isolation itself and
+// the BFF never relies on that alone (defence in depth, REQ-SEC-004).
+message RequestContext {
+  string tenant_id = 1;
+  string correlation_id = 2;
+  string principal = 3;
+}
+
+message FreshnessEnvelope {
+  // Wall-clock time at which the source last refreshed this record.
+  google.protobuf.Timestamp last_updated = 1;
+  // Server time at response generation, used by the BFF for clock-skew
+  // correction (REQ-EDGE-010).
+  google.protobuf.Timestamp server_time = 2;
+  // Source-declared confidence that the record reflects reality.
+  string refresh_source = 3; // e.g. "poller", "event-stream", "reconciler"
+  // Monotonic version of the record; used for conflict detection.
+  uint64 version = 4;
+}
+
+message GetResourceFreshnessRequest {
+  RequestContext context = 1;
+  string resource_id = 2;
+}
+
+message GetResourceFreshnessResponse {
+  string resource_id = 1;
+  bool found = 2;
+  FreshnessEnvelope freshness = 3;
+}
+
+message GetResourceRequest {
+  RequestContext context = 1;
+  string resource_id = 2;
+  // Optional projection; empty means "all".
+  repeated string field_mask = 3;
+}
+
+message GetResourceResponse {
+  OperationalResource resource = 1;
+}
+
+message GetResourceStateRequest {
+  RequestContext context = 1;
+  string resource_id = 2;
+}
+
+message GetResourceStateResponse {
+  string resource_id = 1;
+  ResourceState state = 2;
+  string substate = 3;
+  FreshnessEnvelope freshness = 4;
+  // Carried on the narrow read as well as the full one. Without it the BFF
+  // cannot tell, from a cheap status read, that a workflow is mutating the
+  // resource -- and the "a running execution may override operational state"
+  // precedence rule could only ever fire on the expensive both-source
+  // endpoints, leaving /status and /details disagreeing (REQ-PREC-003).
+  string in_flight_execution_ref = 5;
+}
+
+message BatchGetResourcesRequest {
+  RequestContext context = 1;
+  repeated string resource_ids = 2;
+}
+
+message BatchGetResourcesResponse {
+  repeated OperationalResource resources = 1;
+  repeated string missing_resource_ids = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  HealthState state = 1;
+  string detail = 2;
+}
+
+// The operational record. Field names intentionally do NOT match the canonical
+// model (customer_ref vs customerId, state vs status, ...).
+message OperationalResource {
+  string resource_id = 1;
+  string customer_ref = 2;
+  string tenant_id = 3;
+  string resource_type = 4;
+  ResourceState state = 5;
+  string substate = 6;
+
+  OwnershipRecord ownership = 7;
+  map<string, string> configuration = 8;
+  repeated MetricSample metrics = 9;
+  TopologyRecord topology = 10;
+  map<string, string> operational_metadata = 11;
+  map<string, string> labels = 12;
+
+  FreshnessEnvelope freshness = 13;
+
+  // Set when the ODS itself knows an execution is mutating this resource.
+  // Used by SourcePrecedencePolicy (REQ-PREC-003).
+  string in_flight_execution_ref = 14;
+
+  // Schema contract version emitted by the source (REQ-EDGE-017).
+  string schema_version = 15;
+}
+
+message OwnershipRecord {
+  string owner_id = 1;
+  string owner_type = 2; // "team" | "user" | "service"
+  string owner_email = 3;
+  string cost_centre = 4;
+}
+
+message MetricSample {
+  string name = 1;
+  double value = 2;
+  string unit = 3;
+  google.protobuf.Timestamp sampled_at = 4;
+}
+
+message TopologyRecord {
+  string region = 1;
+  string zone = 2;
+  string cluster = 3;
+  repeated string upstream_refs = 4;
+  repeated string downstream_refs = 5;
+}

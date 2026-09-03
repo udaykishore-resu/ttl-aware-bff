@@ -1,0 +1,126 @@
+# Development values.
+#
+#   helm upgrade --install bff deploy/helm/ttl-aware-bff \
+#     -n bff --create-namespace \
+#     -f deploy/helm/ttl-aware-bff/values-dev.yaml
+#
+# Dev optimises for observability and cost, not availability: one replica, full
+# trace sampling, debug logs, short TTLs so a fresh -> stale -> fallback
+# transition is visible in seconds rather than minutes.
+
+fullnameOverride: ttl-aware-bff
+
+image:
+  tag: dev
+  # Dev pushes reuse the `dev` tag, so the node must not serve a cached layer.
+  pullPolicy: Always
+
+# One replica: an HPA with minReplicas 3 and a PDB would both fight it.
+replicaCount: 1
+autoscaling:
+  enabled: false
+pdb:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+goMemLimit: "400MiB"
+
+# A single replica cannot satisfy a DoNotSchedule zone constraint.
+topologySpreadConstraints: []
+affinity: {}
+
+serviceAccount:
+  roleArn: "arn:aws:iam::111111111111:role/ttl-aware-bff-irsa-dev"
+
+# In-cluster Redis; no ElastiCache in dev.
+redis:
+  enabled: true
+
+# No AUTH token and the JWKS path is used, so nothing needs a Secret.
+secrets:
+  existingSecret: ""
+  create: false
+
+otel:
+  enabled: true
+  environment: dev
+  # Sample everything: in dev you are here to look at traces.
+  traceSampleRatio: 1.0
+  log:
+    level: debug
+    format: text
+  resourceAttributes:
+    cluster: dev-use1
+
+# Faster freshness transitions make the routing rules easy to demonstrate.
+routingOverrides:
+  request_types:
+    resource_status:
+      ttl: 5s
+      cache_ttl: 1s
+      max_stale: 30s
+    resource_configuration:
+      ttl: 10s
+      cache_ttl: 3s
+      max_stale: 60s
+    resource_read:
+      ttl: 10s
+      cache_ttl: 2s
+
+# A second tenant to exercise the per-tenant override path end to end.
+tenantOverrides:
+  acme:
+    routing:
+      request_types:
+        resource_status:
+          ttl: 2s
+    security:
+      rate_limit:
+        rps: 1000
+        burst: 2000
+
+ingress:
+  enabled: true
+  host: bff.dev.example.com
+  alb:
+    scheme: internal
+    groupName: bff-dev
+    loadBalancerName: ttl-aware-bff-alb-dev
+    certificateArn: "arn:aws:acm:us-east-1:111111111111:certificate/11111111-1111-1111-1111-111111111111"
+    # No Web ACL on an internal dev load balancer.
+    wafAclArn: ""
+    shieldAdvanced: false
+    accessLogsBucket: ""
+
+# Dev clusters frequently run the AWS VPC CNI without policy enforcement, where
+# these objects would be accepted and silently ignored. Leaving them off keeps
+# the rendered manifest honest.
+networkPolicy:
+  enabled: false
+
+serviceMonitor:
+  enabled: true
+  interval: 10s
+
+extraEnv:
+  # Longer upstream budgets: the dev stubs are slower and chattier, and a
+  # timeout here would mask the behaviour being demonstrated.
+  - name: BFF_SOURCES__OPERATIONAL__CALL_TIMEOUT
+    value: "2s"
+  - name: BFF_SOURCES__EXECUTION__CALL_TIMEOUT
+    value: "3s"
+  # Circuit breakers that open after a handful of failures are noise in a
+  # cluster someone is actively poking at.
+  - name: BFF_SOURCES__OPERATIONAL__BREAKER__MINIMUM_REQUESTS
+    value: "100"
+
+config:
+  security:
+    rate_limit:
+      rps: 1000
+      burst: 2000

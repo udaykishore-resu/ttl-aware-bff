@@ -1,0 +1,71 @@
+# Grafana provisioning — datasources.
+#
+# Mounted at /etc/grafana/provisioning/datasources/ by docker-compose.yaml.
+# Grafana reads this at start-up, so the local stack comes up with Prometheus
+# and Jaeger already wired, no clicking required.
+#
+# https://grafana.com/docs/grafana/latest/administration/provisioning/#datasources
+
+apiVersion: 1
+
+# Datasources removed from this file are also removed from Grafana on restart,
+# which keeps provisioning declarative rather than additive.
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+  - name: Jaeger
+    orgId: 1
+
+datasources:
+  # --- Metrics ---------------------------------------------------------------
+  - name: Prometheus
+    type: prometheus
+    uid: bff-prometheus
+    access: proxy
+    # Service name and port from docker-compose.yaml (container port, not the
+    # published one).
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      # Must be >= prometheus.yml global.scrape_interval or Grafana will ask for
+      # resolution Prometheus does not have.
+      timeInterval: 15s
+      # Exemplars are what turn a latency spike in bff_request_latency into a
+      # click-through to the offending trace. The BFF emits trace_id exemplars
+      # on its histograms.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: bff-jaeger
+          urlDisplayLabel: View trace
+
+  # --- Traces ----------------------------------------------------------------
+  - name: Jaeger
+    type: jaeger
+    uid: bff-jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false
+    jsonData:
+      # Trace -> logs is not configured: the local stack sends logs to the
+      # collector's debug exporter (stdout), not to Loki.
+      #
+      # Trace -> metrics lets a span in `bff.request` jump to the matching
+      # latency series. Tag mapping follows the contract's common attributes
+      # (docs/DESIGN-CONTRACT.md §7).
+      tracesToMetrics:
+        datasourceUid: bff-prometheus
+        tags:
+          - key: service.name
+            value: service
+          - key: request_type
+            value: request_type
+        queries:
+          - name: Request rate
+            query: 'sum(rate(bff_request_total{$$__tags}[5m]))'
+          - name: p99 latency
+            query: 'histogram_quantile(0.99, sum by (le) (rate(bff_request_latency_bucket{$$__tags}[5m])))'
+      # Renders the service dependency graph from span data.
+      nodeGraph:
+        enabled: true

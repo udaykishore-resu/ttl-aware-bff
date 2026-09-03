@@ -1,0 +1,37 @@
+%% Last rung of the degradation ladder: both sources unavailable, a logically
+%% expired cache entry is still physically present, and policy permits serving
+%% it. Rule id degrade.stale_cache, HTTP 200 with meta.degraded = true.
+sequenceDiagram
+    autonumber
+    actor UI as Console
+    participant SVC as application.Service
+    participant CA as cache.Manager
+    participant R as router
+    participant ODS as Operational Data Source
+    participant EDS as Execution Data Source
+
+    note over CA: an entry for this key was stored 40s ago with<br/>cache_ttl 3s and physical lifetime 3s + stale_grace 5m,<br/>so it is logically expired but still physically resident
+
+    UI->>SVC: GET /resources/R007/status (tenant local)
+    SVC->>CA: GetOrLoad(key, 3s)
+    CA->>CA: Get -> entry.Expired(now) = true
+    CA-->>SVC: miss (the ordinary read path cannot see expired entries)
+
+    SVC->>R: Select(...)
+    R-->>SVC: Target=NONE, Rule=health.both_unavailable<br/>reason: operational is CIRCUIT_OPEN and execution is CIRCUIT_OPEN
+    SVC-->>SVC: NO_SOURCE_AVAILABLE
+
+    rect rgb(253, 240, 240)
+        note over SVC,CA: serveStale — a policy decision, never a convenience
+        SVC->>SVC: cause is NO_SOURCE_AVAILABLE -> eligible
+        SVC->>SVC: rule.AllowStale for resource_status = true<br/>(tenant globex has allow_stale:false and gets a 503 here)
+        SVC->>SVC: classification consistency != strong
+        SVC->>CA: GetStale(key)
+        CA-->>SVC: entry (not negative) + layer L2
+        SVC->>SVC: EffectiveFreshness(now).Age = 40s <= max_stale 120s
+        SVC->>SVC: stale_response_total++, log WARN with age_seconds
+    end
+
+    SVC-->>UI: 200 OK<br/>meta.routingDecision=NONE<br/>meta.routingRule=degrade.stale_cache<br/>meta.degraded=true<br/>meta.cache={hit:true, layer:"L2", ageMs:40000}<br/>meta.sources=[CACHE, OPERATIONAL]<br/>warnings=[STALE_DATA]
+
+    note over SVC,UI: If any guard had failed — allow_stale false, age past<br/>max_stale, strong consistency, no entry, or a caller-caused<br/>error — the answer is 503 NO_SOURCE_AVAILABLE listing<br/>both source states, retryable: true.

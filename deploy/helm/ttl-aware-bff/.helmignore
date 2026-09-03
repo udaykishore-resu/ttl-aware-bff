@@ -1,0 +1,45 @@
+# Patterns to ignore when packaging the chart (`helm package`).
+# Same syntax as .gitignore; matched against the chart directory.
+
+# --- VCS --------------------------------------------------------------------
+.git/
+.gitignore
+.bzr/
+.hg/
+.svn/
+
+# --- Editors and OS cruft ---------------------------------------------------
+.idea/
+.vscode/
+*.tmproj
+*.swp
+*.swo
+*.bak
+*.orig
+*~
+.DS_Store
+
+# --- CI / tooling -----------------------------------------------------------
+.github/
+.circleci/
+ci/
+Makefile
+*.tar.gz
+
+# --- Chart build artefacts --------------------------------------------------
+# Chart.lock and charts/ ARE packaged (they pin the Redis dependency), so they
+# are not listed here. These are the by-products of repeated packaging runs.
+*.tgz
+tmp/
+
+# --- Environment value files ------------------------------------------------
+# values-dev.yaml and values-prod.yaml are examples that belong in the package
+# so users can read them. Anything holding a real secret must not be:
+values-local.yaml
+secrets*.yaml
+*.dec.yaml
+.env
+
+# --- Test output ------------------------------------------------------------
+__snapshot__/
+tests/output/

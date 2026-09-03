@@ -1,0 +1,319 @@
+# Deployment for the TTL-aware BFF.
+#
+# Shutdown arithmetic — the three numbers must stay consistent:
+#
+#   preStop sleep                     10s   endpoints propagate, stop new traffic
+#   server.shutdown_grace (bff.yaml)  25s   drain in-flight requests
+#   terminationGracePeriodSeconds     45s   10 + 25 + 10s of headroom
+#
+# terminationGracePeriodSeconds covers the preStop hook AND the SIGTERM drain,
+# so it must exceed their sum. If the pod is still alive at 45s the kubelet
+# sends SIGKILL and in-flight requests are dropped.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ttl-aware-bff
+  namespace: bff
+  labels:
+    app.kubernetes.io/name: ttl-aware-bff
+    app.kubernetes.io/instance: ttl-aware-bff
+    app.kubernetes.io/component: bff
+    app.kubernetes.io/part-of: ttl-aware-bff
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    kubernetes.io/description: "TTL-aware BFF routing between the operational (gRPC) and execution (REST) data sources."
+spec:
+  # Baseline. The HPA owns this field once it is running; kustomize/Helm should
+  # not fight it (see hpa.yaml).
+  replicas: 3
+  revisionHistoryLimit: 5
+  # Long enough for a slow image pull, short enough to alert on a wedged
+  # rollout rather than waiting forever.
+  progressDeadlineSeconds: 600
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ttl-aware-bff
+      app.kubernetes.io/instance: ttl-aware-bff
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Add one pod before removing one: capacity never dips below `replicas`
+      # during a rollout, which matters because the BFF is on the read path.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ttl-aware-bff
+        app.kubernetes.io/instance: ttl-aware-bff
+        app.kubernetes.io/component: bff
+        app.kubernetes.io/part-of: ttl-aware-bff
+        app.kubernetes.io/version: "0.0.0"
+      annotations:
+        # Rolls the Deployment when the config or secret changes. kustomize's
+        # configMapGenerator hashes names automatically; these are kept for the
+        # plain-manifest path and for secrets, which are not hashed.
+        # Recompute with:
+        #   kubectl -n bff get cm ttl-aware-bff-config -o yaml | sha256sum
+        checksum/config: "replace-on-config-change"
+        checksum/secret: "replace-on-secret-change"
+        # Prometheus here scrapes via the ServiceMonitor, not pod annotations;
+        # these are set false so a cluster running the annotation-based
+        # discovery does not double-scrape.
+        prometheus.io/scrape: "false"
+    spec:
+      serviceAccountName: ttl-aware-bff
+      automountServiceAccountToken: false
+
+      # --- Pod-level security context ------------------------------------
+      securityContext:
+        runAsNonRoot: true
+        # 65532 is distroless' `nonroot`. Stated numerically so the kubelet can
+        # enforce runAsNonRoot without resolving a username in the image.
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 45
+      # Ensures DNS lookups for the two upstreams and Redis resolve promptly.
+      dnsPolicy: ClusterFirst
+
+      # --- Spreading and placement ----------------------------------------
+      topologySpreadConstraints:
+        # Hard: never let a zone hold a disproportionate share of replicas, so
+        # losing an AZ costs at most ceil(replicas/zones) capacity.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ttl-aware-bff
+              app.kubernetes.io/instance: ttl-aware-bff
+        # Soft: prefer one pod per node, but do not block scheduling when the
+        # cluster is small or an HPA scale-up outruns the node group.
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ttl-aware-bff
+              app.kubernetes.io/instance: ttl-aware-bff
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+          preferredDuringSchedulingIgnoredDuringExecution:
+            # Prefer the dedicated on-demand pool; tolerate landing elsewhere.
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: workload-class
+                    operator: In
+                    values: ["general"]
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ttl-aware-bff
+                    app.kubernetes.io/instance: ttl-aware-bff
+
+      containers:
+        - name: bff
+          image: ghcr.io/udaykishore/ttl-aware-bff:0.0.0
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/bff/bff.yaml"]
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 9090
+              protocol: TCP
+
+          # --- Container security context ---------------------------------
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          # --- Configuration ----------------------------------------------
+          env:
+            # Downward API: identity used as trace/metric resource attributes
+            # and in structured log lines.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+            # GOMAXPROCS pinned to the CPU limit. Without this the Go runtime
+            # sees the node's core count, oversubscribes P's and burns the CFS
+            # quota in scheduling latency.
+            - name: GOMAXPROCS
+              valueFrom:
+                resourceFieldRef:
+                  containerName: bff
+                  resource: limits.cpu
+                  divisor: "1"
+            # Soft memory limit at ~80% of the container limit: the GC gets
+            # aggressive before the kernel OOM-kills the pod.
+            - name: GOMEMLIMIT
+              value: "800MiB"
+
+            # --- BFF_ overrides (prefix + `__` nesting, contract §6) --------
+            - name: BFF_OBSERVABILITY__ENVIRONMENT
+              value: "production"
+            - name: BFF_OBSERVABILITY__SERVICE_VERSION
+              value: "0.0.0"
+            - name: BFF_OBSERVABILITY__OTLP__ENDPOINT
+              value: "otel-collector.observability.svc.cluster.local:4317"
+            - name: BFF_OBSERVABILITY__OTLP__INSECURE
+              value: "true"
+            - name: BFF_CACHE__REDIS__ADDR
+              value: "ttl-aware-bff-redis.bff.svc.cluster.local:6379"
+            - name: BFF_SOURCES__OPERATIONAL__ADDR
+              value: "ttl-aware-bff-opsource.bff.svc.cluster.local:9101"
+            - name: BFF_SOURCES__EXECUTION__BASE_URL
+              value: "http://ttl-aware-bff-exsource.bff.svc.cluster.local:9102"
+
+            # --- OTel SDK variables ----------------------------------------
+            - name: OTEL_SERVICE_NAME
+              value: "ttl-aware-bff"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: "grpc"
+            - name: OTEL_TRACES_SAMPLER
+              value: "parentbased_traceidratio"
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: "0.1"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=bff,deployment.environment=production"
+            - name: OTEL_PROPAGATORS
+              value: "tracecontext,baggage"
+
+          envFrom:
+            # Credentials only. Keys: BFF_REDIS_PASSWORD, BFF_JWT_HS256_SECRET
+            # — the variable names that cache.redis.password_env and
+            # security.jwt.hs256_secret_env point at. See secret.example.yaml.
+            - secretRef:
+                name: ttl-aware-bff-secrets
+                optional: false
+
+          # --- Probes (admin port :9090) -----------------------------------
+          # /healthz  process is up and config parsed
+          # /readyz   dependencies usable; flips to failing on SIGTERM so the
+          #           endpoint is withdrawn before the drain begins
+          # /livez    event loop responsive; restart-worthy only
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 2
+            timeoutSeconds: 2
+            # 30 * 2s = up to 60s to warm up (JWKS fetch, Redis pool, gRPC
+            # connections) before liveness starts counting failures.
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 2
+            successThreshold: 1
+            # Deliberately more forgiving than readiness: a slow upstream must
+            # cost readiness, never a restart.
+            failureThreshold: 6
+
+          # --- Graceful drain ----------------------------------------------
+          lifecycle:
+            preStop:
+              # Endpoint removal and SIGTERM race each other. Sleeping first
+              # gives kube-proxy/the ALB target group time to stop sending new
+              # connections while the server is still accepting them.
+              #
+              # `sleep` as a native handler needs Kubernetes >= 1.30
+              # (PodLifecycleSleepAction, GA in 1.32). On older clusters this
+              # would have to be an exec hook, which a distroless image cannot
+              # run — another reason the platform baseline is 1.30+.
+              sleep:
+                seconds: 10
+
+          # --- Resources ----------------------------------------------------
+          # Requests are the scheduling contract and the HPA denominator: the
+          # 70% CPU target in hpa.yaml is 70% of the 250m request.
+          # No CPU limit is set on purpose — CFS throttling at the limit adds
+          # tail latency to a latency-sensitive service, and the ceiling is
+          # already enforced by the request-based scheduling plus the HPA.
+          # The memory limit IS set, because memory is incompressible.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 128Mi
+            limits:
+              memory: 1Gi
+              ephemeral-storage: 512Mi
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/bff
+              readOnly: true
+            # readOnlyRootFilesystem: true means the Go runtime and anything
+            # writing a temp file needs a writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+            # Where the cache and profiler write scratch data.
+            - name: cache
+              mountPath: /var/cache/bff
+
+      volumes:
+        - name: config
+          configMap:
+            name: ttl-aware-bff-config
+            items:
+              - key: bff.yaml
+                path: bff.yaml
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: cache
+          emptyDir:
+            sizeLimit: 256Mi

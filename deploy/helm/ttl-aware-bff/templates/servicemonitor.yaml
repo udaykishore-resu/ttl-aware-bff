@@ -1,0 +1,83 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{/*
+ServiceMonitor for the Prometheus Operator.
+
+Requires the monitoring.coreos.com CRDs (kube-prometheus-stack). Scrapes the
+ADMIN port only; networkpolicy.yaml permits exactly that flow from the
+monitoring namespaces.
+
+If the cluster collects metrics through ADOT/AMP instead, set
+serviceMonitor.enabled=false and let the collector's own scrape config take
+over.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "ttl-aware-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+    {{- /* kube-prometheus-stack adopts only ServiceMonitors carrying its
+           release label. A wrong value here means the object is created and
+           silently ignored. */}}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "ttl-aware-bff.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: admin
+      path: /metrics
+      scheme: http
+      # Matches config.observability.metrics_interval so Prometheus never
+      # samples the same OTel export window twice.
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      honorLabels: false
+      # Exemplars carry trace_id, which is what makes the Grafana
+      # latency-histogram-to-trace jump work.
+      honorTimestamps: true
+      metricRelabelings:
+        {{- with .Values.serviceMonitor.dropMetricsRegex }}
+        # Go runtime and process collectors are already covered by cAdvisor and
+        # multiply cardinality across a large fleet.
+        - sourceLabels: [__name__]
+          regex: {{ . | quote }}
+          action: drop
+        {{- end }}
+        {{- with .Values.serviceMonitor.tenantLabelMaxLength }}
+        # A per-tenant label is what makes these metrics useful (design
+        # contract §7), but a bug putting a request id there would take
+        # Prometheus down. Anything over the cap lands in one `overflow` bucket.
+        - sourceLabels: [tenant_id]
+          regex: {{ printf "(.{1,%d})" (int .) | quote }}
+          targetLabel: tenant_id
+          replacement: "$1"
+          action: replace
+        - sourceLabels: [tenant_id]
+          regex: {{ printf ".{%d,}" (add (int .) 1) | quote }}
+          targetLabel: tenant_id
+          replacement: "overflow"
+          action: replace
+        {{- end }}
+      relabelings:
+        # Promote pod/node identity so a single misbehaving replica can be
+        # isolated from a dashboard.
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+          action: replace
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+          action: replace
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+          action: replace
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_version]
+          targetLabel: version
+          action: replace
+{{- end }}

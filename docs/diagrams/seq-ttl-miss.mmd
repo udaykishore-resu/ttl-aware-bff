@@ -1,0 +1,33 @@
+%% TTL miss: GET /api/v1/resources/R013/status. The seeded operational record is
+%% 30s old against a 10s TTL, so rule ttl.operational.stale fires and, because
+%% resource_status has fallback: execution and the EDS is healthy, branch (a)
+%% routes to the execution source instead of serving stale operational data.
+sequenceDiagram
+    autonumber
+    actor UI as Console
+    participant SVC as application.Service
+    participant CA as cache.Manager
+    participant R as router
+    participant F as freshness.Manager
+    participant ODS as Operational Data Source
+    participant EDS as Execution Data Source
+
+    UI->>SVC: GET /resources/R013/status (tenant local)
+    SVC->>CA: GetOrLoad(key, cache_ttl=3s)
+    CA-->>SVC: miss
+    SVC->>R: Select(...)
+    R->>F: Assess(tenant, R013, ttl=10s)
+    F->>ODS: GetResourceFreshness
+    ODS-->>F: last_updated = now-30s
+    F-->>R: STALE, age 30s > ttl 10s
+
+    rect rgb(253, 246, 236)
+        note over R: rule ttl.operational.stale, branch (a)<br/>fallback=execution and EDS is available,<br/>so a current answer from the slow source beats<br/>a stale answer from the fast one
+        R->>R: hooks.OnTTL(hit=false) -> operational_ttl_miss_total++<br/>hooks.OnFallback(OPERATIONAL -> EXECUTION) -> execution_fallback_total++
+    end
+
+    R-->>SVC: Target=EXECUTION<br/>Rule=ttl.operational.stale<br/>Primary=EXECUTION
+    SVC->>EDS: GET /eds/v1/resources/R013/latest-execution
+    EDS-->>SVC: execution record (~120ms base latency)
+    SVC->>SVC: merge: operational candidate absent,<br/>status comes from the execution record
+    SVC-->>UI: 200 OK<br/>meta.routingDecision=EXECUTION<br/>meta.routingRule=ttl.operational.stale<br/>meta.freshness.state=UNKNOWN (execution data carries no freshness TTL)

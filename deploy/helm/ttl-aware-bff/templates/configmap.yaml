@@ -1,0 +1,26 @@
+{{/*
+ConfigMap carrying the full bff.yaml, mounted at /etc/bff/bff.yaml.
+
+The content comes from the `ttl-aware-bff.config` helper, which merges
+.Values.config with the derived settings (OTLP endpoint, Redis address, image
+tag) and then with routingOverrides / tenantOverrides. Rendering it through one
+helper means the deployment's checksum annotation and this object can never
+disagree about what the config is.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ttl-aware-bff.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ttl-aware-bff.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  # Key layout is fixed by docs/DESIGN-CONTRACT.md §6. No secret value appears
+  # here: config carries only the NAME of the env var holding a credential
+  # (cache.redis.password_env, security.jwt.hs256_secret_env).
+  bff.yaml: |
+    {{- include "ttl-aware-bff.config" . | nindent 4 }}

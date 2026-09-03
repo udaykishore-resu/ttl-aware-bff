@@ -1,0 +1,56 @@
+%% Circuit breaker state machine — internal/resilience/breaker.go.
+%% One breaker per data source. Parameter values are the configs/bff.yaml
+%% defaults, which are identical for the operational and execution sources.
+stateDiagram-v2
+    direction LR
+
+    [*] --> Closed
+
+    Closed: Closed
+    Closed: calls pass through
+    Closed: outcomes land in a ring of 10 buckets over window=30s
+    Closed: so a burst of failures ages out gradually
+    Closed: circuit_breaker_state = 0
+
+    Open: Open
+    Open: Allow() returns CIRCUIT_OPEN without calling the source
+    Open: rejections are counted in the window
+    Open: Health.Detail = CIRCUIT_OPEN so the router sees it pre-flight
+    Open: circuit_breaker_state = 2
+
+    HalfOpen: HalfOpen
+    HalfOpen: at most half_open_max_calls=3 concurrent probes admitted
+    HalfOpen: further callers rejected as CIRCUIT_OPEN
+    HalfOpen: Health.Detail = CIRCUIT_HALF_OPEN and the source counts as available
+    HalfOpen: circuit_breaker_state = 1
+
+    Closed --> Open: failure ratio >= failure_threshold 0.5 over >= minimum_requests 20 in 30s
+    Open --> HalfOpen: open_timeout 5s elapsed (evaluated lazily on the next State read)
+    HalfOpen --> Closed: half_open_successes=2 consecutive successes, window cleared on close
+    HalfOpen --> Open: any single failure while probing
+    Closed --> Closed: success, or failure below the threshold or below minimum_requests
+
+    note right of Closed
+        ABSTAIN — Breaker.Do returns without calling Record at
+        all, so these count neither as success nor as failure:
+        NOT_FOUND, INVALID_REQUEST, FORBIDDEN, UNAUTHENTICATED,
+        TENANT_MISMATCH, and SCHEMA_VERSION_MISMATCH, where the
+        source is up, fast and answering correctly and the BFF
+        simply does not understand its contract. That one also
+        surfaces through schema_version_mismatch_total, a 502
+        where no fallback exists, and the call-time fallback
+        where one does.
+
+        Abstaining, rather than recording a success, matters in
+        the HalfOpen state: a source answering nothing but 404s
+        while it is genuinely down would otherwise accumulate
+        successes, meet half_open_successes and be re-admitted
+        to full traffic.
+
+        Timeouts and transport failures do count.
+    end note
+
+    note right of Open
+        Every transition emits circuit_breaker_transition_total
+        with from and to attributes, fired outside the mutex.
+    end note
