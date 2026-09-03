@@ -25,13 +25,13 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/api/response"
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/observability"
-	"github.com/udaykishore/ttl-aware-bff/internal/resilience"
-	"github.com/udaykishore/ttl-aware-bff/internal/security"
-	"github.com/udaykishore/ttl-aware-bff/pkg/correlation"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/api/response"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/observability"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/resilience"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/security"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/correlation"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // Middleware is the standard decorator signature.

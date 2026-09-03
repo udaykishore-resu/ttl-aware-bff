@@ -27,14 +27,14 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/datasource"
-	opsv1 "github.com/udaykishore/ttl-aware-bff/internal/datasource/operational/opsv1"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/mapper"
-	"github.com/udaykishore/ttl-aware-bff/internal/resilience"
-	"github.com/udaykishore/ttl-aware-bff/pkg/correlation"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/datasource"
+	opsv1 "github.com/udaykishore-resu/ttl-aware-bff/internal/datasource/operational/opsv1"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/mapper"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/resilience"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/correlation"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // sourceName is the label used in errors, metrics and breaker identity.

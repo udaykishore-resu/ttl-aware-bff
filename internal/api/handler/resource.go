@@ -14,16 +14,16 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/api/middleware"
-	"github.com/udaykishore/ttl-aware-bff/internal/api/response"
-	"github.com/udaykishore/ttl-aware-bff/internal/application"
-	"github.com/udaykishore/ttl-aware-bff/internal/classifier"
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/observability"
-	"github.com/udaykishore/ttl-aware-bff/internal/security"
-	"github.com/udaykishore/ttl-aware-bff/pkg/correlation"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/api/middleware"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/api/response"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/application"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/classifier"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/observability"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/security"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/correlation"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // Resource serves the /api/v1/resources endpoints.

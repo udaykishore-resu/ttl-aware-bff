@@ -18,11 +18,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/classifier"
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/freshness"
-	"github.com/udaykishore/ttl-aware-bff/internal/policy"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/classifier"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/freshness"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/policy"
 )
 
 // Target is the set of sources a decision selects.

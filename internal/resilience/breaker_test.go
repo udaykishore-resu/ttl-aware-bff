@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/testutil"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/testutil"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // breakerEpoch is a fixed instant every breaker test starts from, so that no

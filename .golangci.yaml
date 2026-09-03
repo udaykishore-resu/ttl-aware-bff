@@ -213,7 +213,7 @@ linters-settings:
     check-exported: false
 
   goimports:
-    local-prefixes: github.com/udaykishore/ttl-aware-bff
+    local-prefixes: github.com/udaykishore-resu/ttl-aware-bff
 
 issues:
   # Defaults hide a lot. Everything enabled above is meant to be seen.

@@ -5,7 +5,7 @@ package in this repository is written against. It is intentionally terse: it
 fixes *names*, *paths*, *keys* and *numbers* so that specs, code, deployment
 manifests and diagrams cannot drift apart.
 
-Module path: `github.com/udaykishore/ttl-aware-bff`
+Module path: `github.com/udaykishore-resu/ttl-aware-bff`
 Go: `1.24`
 
 ## 1. Binaries

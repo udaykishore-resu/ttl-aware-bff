@@ -48,7 +48,7 @@ info:
     code, fall back to the HTTP status.
   contact:
     name: TTL-Aware BFF maintainers
-    url: https://github.com/udaykishore/ttl-aware-bff
+    url: https://github.com/udaykishore-resu/ttl-aware-bff
   license:
     name: Apache-2.0
     identifier: Apache-2.0

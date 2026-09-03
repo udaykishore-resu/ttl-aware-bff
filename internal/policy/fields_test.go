@@ -4,9 +4,9 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/testutil"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/testutil"
 )
 
 // catalog builds a catalogue over an explicit supplier table.

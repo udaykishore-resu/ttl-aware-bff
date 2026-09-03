@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/datasource"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/testutil"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/datasource"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/testutil"
 )
 
 var base = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)

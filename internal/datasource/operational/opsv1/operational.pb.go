@@ -1322,7 +1322,7 @@ const file_operational_v1_operational_proto_rawDesc = "" +
 	"\vGetResource\x12\".operational.v1.GetResourceRequest\x1a#.operational.v1.GetResourceResponse\x12e\n" +
 	"\x10GetResourceState\x12'.operational.v1.GetResourceStateRequest\x1a(.operational.v1.GetResourceStateResponse\x12h\n" +
 	"\x11BatchGetResources\x12(.operational.v1.BatchGetResourcesRequest\x1a).operational.v1.BatchGetResourcesResponse\x12G\n" +
-	"\x06Health\x12\x1d.operational.v1.HealthRequest\x1a\x1e.operational.v1.HealthResponseBRZPgithub.com/udaykishore/ttl-aware-bff/internal/datasource/operational/opsv1;opsv1b\x06proto3"
+	"\x06Health\x12\x1d.operational.v1.HealthRequest\x1a\x1e.operational.v1.HealthResponseBRZPgithub.com/udaykishore-resu/ttl-aware-bff/internal/datasource/operational/opsv1;opsv1b\x06proto3"
 
 var (
 	file_operational_v1_operational_proto_rawDescOnce sync.Once

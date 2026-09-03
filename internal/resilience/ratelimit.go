@@ -7,7 +7,7 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
 )
 
 // RateLimiter admits requests per tenant (or globally) using a token bucket.

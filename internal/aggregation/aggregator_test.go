@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/policy"
-	"github.com/udaykishore/ttl-aware-bff/internal/testutil"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/policy"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/testutil"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 var base = time.Date(2026, 7, 14, 11, 0, 0, 0, time.UTC)

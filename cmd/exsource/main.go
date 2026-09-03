@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/mapper"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/mapper"
 )
 
 func main() {

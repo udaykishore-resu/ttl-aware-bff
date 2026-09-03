@@ -1,6 +1,6 @@
 # TTL-Aware BFF — Requirements Catalogue
 
-Normative specification for `github.com/udaykishore/ttl-aware-bff`. This document
+Normative specification for `github.com/udaykishore-resu/ttl-aware-bff`. This document
 is the root of traceability: every other file under `spec/`, every package under
 `internal/`, and every test under `test/` cites the IDs defined here. IDs are
 **stable and never renumbered**; a withdrawn requirement is marked `WITHDRAWN`

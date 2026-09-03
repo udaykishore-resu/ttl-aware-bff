@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/datasource"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/datasource"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
 )
 
 // Evaluation is the outcome of applying a TTL to an observation.

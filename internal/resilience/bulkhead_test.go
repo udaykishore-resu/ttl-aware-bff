@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/testutil"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/testutil"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 func bulkheadCfg(maxConcurrent, maxQueue int, acquire time.Duration) config.BulkheadConfig {

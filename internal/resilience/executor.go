@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // Executor composes the four mechanisms into the single call wrapper the

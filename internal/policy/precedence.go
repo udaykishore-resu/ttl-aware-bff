@@ -3,8 +3,8 @@ package policy
 import (
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
 )
 
 // Candidate is one source's offer for a field.

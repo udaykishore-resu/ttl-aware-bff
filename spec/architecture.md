@@ -1,6 +1,6 @@
 # TTL-Aware BFF — Architecture
 
-Scope: the internal structure of `github.com/udaykishore/ttl-aware-bff`, the
+Scope: the internal structure of `github.com/udaykishore-resu/ttl-aware-bff`, the
 dependency rule that keeps it maintainable, the request lifecycle, the
 concurrency model, failure domains and the scaling model.
 

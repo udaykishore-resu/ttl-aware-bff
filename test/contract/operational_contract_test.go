@@ -28,10 +28,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	opsv1 "github.com/udaykishore/ttl-aware-bff/internal/datasource/operational/opsv1"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/mapper"
-	"github.com/udaykishore/ttl-aware-bff/internal/testutil"
+	opsv1 "github.com/udaykishore-resu/ttl-aware-bff/internal/datasource/operational/opsv1"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/mapper"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/testutil"
 )
 
 // dialOperational connects to the ODS named by OPERATIONAL_ADDR, defaulting to

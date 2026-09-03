@@ -11,8 +11,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
 )
 
 // Canonical field names. These are the strings used in configuration, in

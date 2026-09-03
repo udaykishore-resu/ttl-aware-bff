@@ -6,13 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/classifier"
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/datasource"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/freshness"
-	"github.com/udaykishore/ttl-aware-bff/internal/policy"
-	"github.com/udaykishore/ttl-aware-bff/internal/testutil"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/classifier"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/datasource"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/freshness"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/policy"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/testutil"
 )
 
 var now = time.Date(2026, 5, 20, 9, 0, 0, 0, time.UTC)

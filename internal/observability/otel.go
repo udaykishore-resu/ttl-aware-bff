@@ -20,11 +20,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
 )
 
 // InstrumentationName is the scope attached to every span and instrument.
-const InstrumentationName = "github.com/udaykishore/ttl-aware-bff"
+const InstrumentationName = "github.com/udaykishore-resu/ttl-aware-bff"
 
 // Provider owns the OpenTelemetry pipelines and the service's metric
 // instruments. One is created at startup and shut down on exit.

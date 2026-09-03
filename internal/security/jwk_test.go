@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/testutil"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/testutil"
 )
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }

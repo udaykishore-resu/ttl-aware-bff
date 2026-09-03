@@ -17,15 +17,15 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/api/handler"
-	"github.com/udaykishore/ttl-aware-bff/internal/api/middleware"
-	"github.com/udaykishore/ttl-aware-bff/internal/api/response"
-	"github.com/udaykishore/ttl-aware-bff/internal/application"
-	"github.com/udaykishore/ttl-aware-bff/internal/classifier"
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/observability"
-	"github.com/udaykishore/ttl-aware-bff/internal/resilience"
-	"github.com/udaykishore/ttl-aware-bff/internal/security"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/api/handler"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/api/middleware"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/api/response"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/application"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/classifier"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/observability"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/resilience"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/security"
 )
 
 // Server owns both listeners and their lifecycle.

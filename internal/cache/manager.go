@@ -7,7 +7,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
 )
 
 // Layered composes an in-process L1 in front of a distributed L2.

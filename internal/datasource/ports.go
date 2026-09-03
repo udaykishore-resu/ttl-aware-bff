@@ -15,7 +15,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
 )
 
 // Health describes a source's current usability, as judged locally by the

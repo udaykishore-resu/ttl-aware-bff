@@ -18,10 +18,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/datasource"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/policy"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/datasource"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/policy"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // Task is one source call in a fan-out.

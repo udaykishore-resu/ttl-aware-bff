@@ -15,8 +15,8 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/pkg/correlation"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/correlation"
 )
 
 // Attribute keys. Every log record, metric and span uses these exact strings.

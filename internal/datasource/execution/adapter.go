@@ -27,13 +27,13 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/internal/datasource"
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/internal/mapper"
-	"github.com/udaykishore/ttl-aware-bff/internal/resilience"
-	"github.com/udaykishore/ttl-aware-bff/pkg/correlation"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/datasource"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/mapper"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/resilience"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/correlation"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 const sourceName = "EXECUTION"

@@ -14,9 +14,9 @@ appVersion: "0.1.0"
 
 kubeVersion: ">=1.30.0-0"
 
-home: https://github.com/udaykishore/ttl-aware-bff
+home: https://github.com/udaykishore-resu/ttl-aware-bff
 sources:
-  - https://github.com/udaykishore/ttl-aware-bff
+  - https://github.com/udaykishore-resu/ttl-aware-bff
 icon: https://raw.githubusercontent.com/udaykishore/ttl-aware-bff/main/docs/icon.png
 
 keywords:

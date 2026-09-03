@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // ExecutionSchemaVersion is the EDS contract version this build understands.

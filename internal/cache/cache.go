@@ -23,7 +23,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
 )
 
 // ErrMiss is returned by Get when the key is absent.

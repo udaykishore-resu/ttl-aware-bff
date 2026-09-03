@@ -12,9 +12,9 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/domain"
-	"github.com/udaykishore/ttl-aware-bff/pkg/correlation"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/domain"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/correlation"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // Envelope is the success document. Every 2xx body has exactly this shape,

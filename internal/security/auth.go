@@ -21,8 +21,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/udaykishore/ttl-aware-bff/internal/config"
-	"github.com/udaykishore/ttl-aware-bff/pkg/errs"
+	"github.com/udaykishore-resu/ttl-aware-bff/internal/config"
+	"github.com/udaykishore-resu/ttl-aware-bff/pkg/errs"
 )
 
 // Permissions granted by roles and required by endpoints.

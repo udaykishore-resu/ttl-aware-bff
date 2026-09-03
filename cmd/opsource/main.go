@@ -41,7 +41,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	opsv1 "github.com/udaykishore/ttl-aware-bff/internal/datasource/operational/opsv1"
+	opsv1 "github.com/udaykishore-resu/ttl-aware-bff/internal/datasource/operational/opsv1"
 )
 
 func main() {
